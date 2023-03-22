@@ -7,17 +7,13 @@
 
 #pragma once
 
+#include "BuilderAnalysis.h"
 #include "DexClass.h"
 #include "Inliner.h"
 #include "InlinerConfig.h"
-#include "RemoveBuilderPattern.h"
-#include "Resolver.h"
 #include "TypeSystem.h"
 
 namespace builder_pattern {
-
-using InstantiationToUsage =
-    std::unordered_map<const IRInstruction*, std::vector<const IRInstruction*>>;
 
 class BuilderTransform {
  public:
@@ -36,7 +32,7 @@ class BuilderTransform {
    * Try to inline the given calls (`insns`) in the caller, and return the set
    * of call instructions that were not abled to be inlined.
    */
-  std::unordered_set<const IRInstruction*> try_inline_calls(
+  std::unordered_set<IRInstruction*> try_inline_calls(
       DexMethod* caller,
       const std::unordered_set<IRInstruction*>& insns,
       std::vector<IRInstruction*>* deleted_insns);
@@ -55,7 +51,7 @@ class BuilderTransform {
   const DexType* m_root;
   std::unique_ptr<MultiMethodInliner> m_inliner;
   inliner::InlinerConfig m_inliner_config;
-  ConcurrentMethodRefCache m_concurrent_resolved_refs;
+  ConcurrentMethodResolver m_concurrent_method_resolver;
 
   // Used for tracking changes that we need to restore.
   std::unordered_map<DexMethod*, DexMethod*> m_method_copy;

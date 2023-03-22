@@ -92,8 +92,9 @@ class PartialPassTest : public RedexTest {
   void run_passes(const Json::Value& config) {
     setup_stores();
     ConfigFiles conf(config);
+    conf.parse_global_config();
     std::vector<Pass*> passes{pass.get()};
-    PassManager manager(passes, config);
+    PassManager manager(passes, conf);
     manager.set_testing_mode();
     manager.run_passes(stores, conf);
   }

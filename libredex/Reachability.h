@@ -143,9 +143,23 @@ class ReachableObjects {
 
   void record_reachability(const DexMethodRef* member, const DexClass* cls);
 
-  ConcurrentSet<const DexClass*> m_marked_classes;
-  ConcurrentSet<const DexFieldRef*> m_marked_fields;
-  ConcurrentSet<const DexMethodRef*> m_marked_methods;
+  static constexpr size_t MARK_SLOTS = 127;
+
+  ConcurrentSet<const DexClass*,
+                std::hash<const DexClass*>,
+                std::equal_to<const DexClass*>,
+                MARK_SLOTS>
+      m_marked_classes;
+  ConcurrentSet<const DexFieldRef*,
+                std::hash<const DexFieldRef*>,
+                std::equal_to<const DexFieldRef*>,
+                MARK_SLOTS>
+      m_marked_fields;
+  ConcurrentSet<const DexMethodRef*,
+                std::hash<const DexMethodRef*>,
+                std::equal_to<const DexMethodRef*>,
+                MARK_SLOTS>
+      m_marked_methods;
   ReachableObjectGraph m_retainers_of;
 
   friend class RootSetMarker;
@@ -209,6 +223,11 @@ class RootSetMarker {
    * Also conditionally marks class member seeds.
    */
   void mark(const Scope& scope);
+
+  void mark_with_exclusions(
+      const Scope& scope,
+      const ConcurrentSet<const DexClass*>& excluded_classes,
+      const ConcurrentSet<const DexMethod*>& excluded_methods);
 
   /**
    * Mark everything as seed.
@@ -357,7 +376,8 @@ std::unique_ptr<ReachableObjects> compute_reachable_objects(
 
 void sweep(DexStoresVector& stores,
            const ReachableObjects& reachables,
-           ConcurrentSet<std::string>* removed_symbols);
+           ConcurrentSet<std::string>* removed_symbols,
+           bool output_full_removed_symbols = false);
 
 struct ObjectCounts {
   size_t num_classes{0};

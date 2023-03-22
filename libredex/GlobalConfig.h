@@ -39,6 +39,7 @@ struct IRTypeCheckerConfig : public Configurable {
   std::unordered_set<std::string> run_after_passes;
   bool check_no_overwrite_this;
   bool annotated_cfg_on_error{false};
+  bool check_classes;
 };
 
 struct HasherConfig : public Configurable {
@@ -109,9 +110,24 @@ struct MethodProfileOrderingConfig : public Configurable {
   }
 
   std::unordered_set<std::string> method_sorting_allowlisted_substrings{};
-  bool legacy_order{true};
   float min_appear_percent{10.0f};
   float second_min_appear_percent{10.0f};
+  bool skip_similarity_reordering{false};
+};
+
+struct MethodSimilarityOrderingConfig : public Configurable {
+  void bind_config() override;
+
+  std::string get_config_name() override {
+    return "MethodSimilarityOrderingConfig";
+  }
+  std::string get_config_doc() override {
+    return "This configuration is used to direct Redex about ordering methods "
+           "by similarity.";
+  }
+
+  bool disable{true};
+  bool use_class_level_perf_sensitivity{false};
 };
 
 struct ProguardConfig : public Configurable {
@@ -125,6 +141,49 @@ struct ProguardConfig : public Configurable {
 
   std::vector<std::string> blocklist;
   bool disable_default_blocklist{false};
+  bool fail_on_unknown_commands{true};
+};
+
+struct PassManagerConfig : public Configurable {
+  void bind_config() override;
+
+  std::string get_config_name() override { return "PassManagerConfig"; }
+  std::string get_config_doc() override {
+    return "This configuration holds values that influence the PassManager.";
+  }
+
+  std::unordered_map<std::string, std::string> pass_aliases;
+  bool jemalloc_full_stats{false};
+  bool violations_tracking{false};
+};
+
+struct ResourceConfig : public Configurable {
+  void bind_config() override;
+
+  std::string get_config_name() override { return "ResourceConfig"; }
+  std::string get_config_doc() override {
+    return "Options used by many resource optimization passes or global "
+           "cleanup steps.";
+  }
+
+  // Outer R class names that have been customized to hold extra data (which
+  // need special treatment when remapping constants). Not used by all apps.
+  std::unordered_set<std::string> customized_r_classes;
+  // Type names in the resource table (example: "id") which should enable
+  // canonical offsets for entries/values.
+  std::unordered_set<std::string> canonical_entry_types;
+  bool sort_key_strings{false};
+};
+
+struct DexOutputConfig : public Configurable {
+  void bind_config() override;
+
+  std::string get_config_name() override { return "DexOutputConfig"; }
+  std::string get_config_doc() override {
+    return "Options used by the Dex writer.";
+  }
+
+  bool write_class_sizes{false};
 };
 
 class GlobalConfig;
@@ -156,6 +215,10 @@ class GlobalConfig : public Configurable {
   ConfigType* get_config_by_name(const std::string& name) const {
     auto& type = m_global_configs.at(name);
     return static_cast<ConfigType*>(type.get());
+  }
+
+  bool has_config_by_name(const std::string& name) const {
+    return m_global_configs.count(name) != 0;
   }
 
   template <typename ConfigType>

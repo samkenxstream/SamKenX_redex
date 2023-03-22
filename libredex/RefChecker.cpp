@@ -6,8 +6,11 @@
  */
 
 #include "RefChecker.h"
+
 #include "EditableCfgAdapter.h"
 #include "Resolver.h"
+#include "Show.h"
+#include "Trace.h"
 #include "TypeUtil.h"
 
 CodeRefs::CodeRefs(const DexMethod* method) {
@@ -27,6 +30,10 @@ CodeRefs::CodeRefs(const DexMethod* method) {
           auto callee_ref = insn->get_method();
           auto callee =
               resolve_method(callee_ref, opcode_to_search(insn), method);
+          if (!callee && opcode_to_search(insn) == MethodSearch::Virtual) {
+            callee = resolve_method(callee_ref, MethodSearch::InterfaceVirtual,
+                                    method);
+          }
           if (!callee) {
             invalid_refs = true;
             return editable_cfg_adapter::LOOP_BREAK;
@@ -108,7 +115,9 @@ bool RefChecker::check_field(const DexField* field) const {
   return *res;
 }
 
-bool RefChecker::check_class(const DexClass* cls) const {
+bool RefChecker::check_class(
+    const DexClass* cls,
+    const std::unique_ptr<const method_override_graph::Graph>& mog) const {
   if (!check_type(cls->get_type())) {
     return false;
   }
@@ -118,11 +127,26 @@ bool RefChecker::check_class(const DexClass* cls) const {
     return false;
   }
   const auto methods = cls->get_all_methods();
-  if (std::any_of(methods.begin(), methods.end(), [this](DexMethod* method) {
-        return !check_method_and_code(method);
-      })) {
-    return false;
+  for (const auto* method : methods) {
+    if (!check_method_and_code(method)) {
+      return false;
+    }
+    if (mog && method->is_virtual()) {
+      const auto& overriddens =
+          method_override_graph::get_overridden_methods(*mog, method, true);
+      for (const auto* m : overriddens) {
+        if (!m->is_external()) {
+          continue;
+        }
+        if (m_min_sdk_api && !m_min_sdk_api->has_method(m)) {
+          TRACE(REFC, 4, "Risky external method override %s -> %s",
+                SHOW(method), SHOW(m));
+          return false;
+        }
+      }
+    }
   }
+
   return true;
 }
 

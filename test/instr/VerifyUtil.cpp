@@ -18,14 +18,33 @@
 #include "Debug.h"
 #include "DexInstruction.h"
 #include "IRCode.h"
+#include "SanitizersConfig.h"
 #include "Show.h"
 #include "VerifyUtil.h"
 #include "Walkers.h"
+
+int find_class_idx(const DexClasses& classes, const char* name) {
+  for (size_t i = 0; i < classes.size(); ++i) {
+    if (!strcmp(name, classes[i]->get_name()->c_str())) {
+      return i;
+    }
+  }
+  return -1;
+}
 
 DexClass* find_class_named(const DexClasses& classes, const char* name) {
   auto it =
       std::find_if(classes.begin(), classes.end(), [&name](DexClass* cls) {
         return !strcmp(name, cls->get_name()->c_str());
+      });
+  return it == classes.end() ? nullptr : *it;
+}
+
+DexClass* find_class_named(const DexClasses& classes,
+                           const std::function<bool(const char*)>& matcher) {
+  auto it =
+      std::find_if(classes.begin(), classes.end(), [&matcher](DexClass* cls) {
+        return matcher(cls->get_name()->c_str());
       });
   return it == classes.end() ? nullptr : *it;
 }
@@ -143,7 +162,7 @@ DexInstruction* find_instruction(DexMethod* m, DexOpcode opcode) {
   return it == insns.end() ? nullptr : *it;
 }
 
-void verify_type_erased(const DexClass* cls, size_t num_dmethods) {
+void verify_class_merged(const DexClass* cls, size_t num_dmethods) {
   if (!cls) {
     ASSERT_EQ(num_dmethods, 0)
         << "cls is null, can not have " << num_dmethods << " dmethods\n";

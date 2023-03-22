@@ -70,21 +70,27 @@
 
 namespace constant_uses {
 
-ConstantUses::ConstantUses(const cfg::ControlFlowGraph& cfg, DexMethod* method)
-    : ConstantUses(cfg,
-                   method ? is_static(method) : true,
-                   method ? method->get_class() : nullptr,
-                   method ? method->get_proto()->get_rtype() : nullptr,
-                   method ? method->get_proto()->get_args() : nullptr,
-                   [method]() { return show(method); }) {}
+ConstantUses::ConstantUses(const cfg::ControlFlowGraph& cfg,
+                           DexMethod* method,
+                           bool force_type_inference)
+    : ConstantUses(
+          cfg,
+          method ? is_static(method) : true,
+          method ? method->get_class() : nullptr,
+          method ? method->get_proto()->get_rtype() : nullptr,
+          method ? method->get_proto()->get_args() : nullptr,
+          [method]() { return show(method); },
+          force_type_inference) {}
 
 ConstantUses::ConstantUses(const cfg::ControlFlowGraph& cfg,
                            bool is_static,
                            DexType* declaring_type,
                            DexType* rtype,
                            DexTypeList* args,
-                           const std::function<std::string()>& method_describer)
+                           const std::function<std::string()>& method_describer,
+                           bool force_type_inference)
     : m_reaching_definitions(cfg), m_rtype(rtype) {
+  always_assert(!force_type_inference || args);
   m_reaching_definitions.run(reaching_defs::Environment());
 
   bool need_type_inference = false;
@@ -132,7 +138,7 @@ ConstantUses::ConstantUses(const cfg::ControlFlowGraph& cfg,
 
   TRACE(CU, 2, "[CU] ConstantUses(%s) need_type_inference:%u",
         method_describer().c_str(), need_type_inference);
-  if (need_type_inference && args) {
+  if ((need_type_inference && args) || force_type_inference) {
     m_type_inference.reset(new type_inference::TypeInference(cfg));
     m_type_inference->run(is_static, declaring_type, args);
   }
@@ -195,7 +201,7 @@ TypeDemand ConstantUses::get_type_demand(DexType* type) {
 }
 
 static bool is_non_zero_int(IRType type) {
-  return type == SCALAR || type == INT || type == CONST;
+  return type == IRType::SCALAR || type == IRType::INT || type == IRType::CONST;
 }
 
 TypeDemand ConstantUses::get_type_demand(IRInstruction* insn,
@@ -292,25 +298,17 @@ TypeDemand ConstantUses::get_type_demand(IRInstruction* insn,
   case OPCODE_USHR_INT:
   case OPCODE_DIV_INT:
   case OPCODE_REM_INT:
-  case OPCODE_ADD_INT_LIT16:
-  case OPCODE_RSUB_INT:
-  case OPCODE_MUL_INT_LIT16:
-  case OPCODE_AND_INT_LIT16:
-  case OPCODE_OR_INT_LIT16:
-  case OPCODE_XOR_INT_LIT16:
-  case OPCODE_ADD_INT_LIT8:
-  case OPCODE_RSUB_INT_LIT8:
-  case OPCODE_MUL_INT_LIT8:
-  case OPCODE_AND_INT_LIT8:
-  case OPCODE_OR_INT_LIT8:
-  case OPCODE_XOR_INT_LIT8:
-  case OPCODE_SHL_INT_LIT8:
-  case OPCODE_SHR_INT_LIT8:
-  case OPCODE_USHR_INT_LIT8:
-  case OPCODE_DIV_INT_LIT16:
-  case OPCODE_REM_INT_LIT16:
-  case OPCODE_DIV_INT_LIT8:
-  case OPCODE_REM_INT_LIT8:
+  case OPCODE_ADD_INT_LIT:
+  case OPCODE_RSUB_INT_LIT:
+  case OPCODE_MUL_INT_LIT:
+  case OPCODE_AND_INT_LIT:
+  case OPCODE_OR_INT_LIT:
+  case OPCODE_XOR_INT_LIT:
+  case OPCODE_SHL_INT_LIT:
+  case OPCODE_SHR_INT_LIT:
+  case OPCODE_USHR_INT_LIT:
+  case OPCODE_DIV_INT_LIT:
+  case OPCODE_REM_INT_LIT:
     return TypeDemand::Int;
 
   case OPCODE_FILLED_NEW_ARRAY: {
@@ -374,7 +372,8 @@ TypeDemand ConstantUses::get_type_demand(IRInstruction* insn,
       auto t1 = type_environment.get_type(insn->src(0));
       auto t2 = type_environment.get_type(insn->src(1));
       if (!t1.is_top() && !t1.is_bottom() && !t2.is_top() && !t2.is_bottom()) {
-        if (t1.element() == REFERENCE || t2.element() == REFERENCE) {
+        if (t1.element() == IRType::REFERENCE ||
+            t2.element() == IRType::REFERENCE) {
           return TypeDemand::Object;
         }
         if (is_non_zero_int(t1.element()) || is_non_zero_int(t2.element())) {
@@ -397,7 +396,7 @@ TypeDemand ConstantUses::get_type_demand(IRInstruction* insn,
       auto& type_environment = type_environments.at(insn);
       auto t = type_environment.get_type(insn->src(0));
       if (!t.is_top() && !t.is_bottom()) {
-        if (t.element() == REFERENCE) {
+        if (t.element() == IRType::REFERENCE) {
           return TypeDemand::Object;
         }
         if (is_non_zero_int(t.element())) {
@@ -527,6 +526,8 @@ TypeDemand ConstantUses::get_type_demand(IRInstruction* insn,
   }
   case OPCODE_INVOKE_CUSTOM:
   case OPCODE_INVOKE_POLYMORPHIC:
+  case OPCODE_CONST_METHOD_HANDLE:
+  case OPCODE_CONST_METHOD_TYPE:
     not_reached_log(
         "Unsupported instruction {%s} in ConstantUses::get_type_demand\n",
         SHOW(insn));

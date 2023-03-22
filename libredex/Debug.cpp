@@ -7,6 +7,7 @@
 
 #include "Debug.h"
 
+#include <array>
 #include <atomic>
 #include <cstring>
 #include <exception>
@@ -72,6 +73,22 @@ namespace {
 std::atomic<size_t> g_crashing{0};
 
 }; // namespace
+
+namespace redex_debug {
+
+namespace {
+
+std::array<bool, RedexError::MAX + 1> abort_for_type{};
+std::array<bool, RedexError::MAX + 1> no_stacktrace_for_type{};
+
+} // namespace
+
+void set_exc_type_as_abort(RedexError type) { abort_for_type[type] = true; }
+void disable_stack_trace_for_exc_type(RedexError type) {
+  no_stacktrace_for_type[type] = true;
+}
+
+} // namespace redex_debug
 
 void crash_backtrace_handler(int sig) {
   size_t crashing = g_crashing.fetch_add(1);
@@ -171,6 +188,9 @@ void block_multi_asserts(bool block) {
 }
 
 void set_abort_if_not_this_thread() {
+#if defined(__linux__)
+  g_aborting = 0; // Reset for good measure.
+#endif
 #if defined(__linux__) && defined(__GNUC__)
 // See https://gcc.gnu.org/bugzilla/show_bug.cgi?id=55917.
 #if __GNUC__ < 8
@@ -188,8 +208,8 @@ void assert_fail(const char* expr,
                  ...) {
   va_list ap;
   va_start(ap, fmt);
-  std::string msg = format2string(
-      "%s:%u: %s: assertion `%s' failed.\n", file, line, func, expr);
+  std::string msg = format2string("%s:%u: %s: assertion `%s' failed.\n", file,
+                                  line, func, expr);
 
   if (strcmp(fmt, " ") != 0) {
     msg += v_format2string(fmt, ap);
@@ -217,12 +237,22 @@ void assert_fail(const char* expr,
     }
   }
 
+  if (redex_debug::abort_for_type[type]) {
+    // Pretend a termination for `redex.py`.
+    std::cerr << "terminate called after assertion" << std::endl;
+    std::cerr << "  what():  RedexError: " << type << " " << msg << std::endl;
+    if (!redex_debug::no_stacktrace_for_type[type]) {
+      CRASH_BACKTRACE();
+    }
+    _exit(-6);
+  }
+
 #ifdef __linux__
   // Asked to abort if not the set thread. Print message and exit.
   if (g_abort_if_not_tid != 0 && g_abort_if_not_tid != cur) {
     // Pretend a termination for `redex.py`.
     std::cerr << "terminate called after assertion" << std::endl;
-    std::cerr << "  what():  " << msg << std::endl;
+    std::cerr << "  what():  RedexError: " << type << " " << msg << std::endl;
     abort();
   }
 #endif
@@ -243,12 +273,22 @@ VmStats get_mem_stats() {
   if (ifs.fail()) {
     return res;
   }
+  const std::array<std::pair<const char*, uint64_t*>, 3> relevant_stats = {{
+      {"VmPeak:", &res.vm_peak},
+      {"VmHWM:", &res.vm_hwm},
+      {"VmRSS:", &res.vm_rss},
+  }};
+
   std::string line;
   std::regex re("[^:]*:\\s*([0-9]*)\\s*(.)B");
   while (std::getline(ifs, line)) {
-    bool is_vm_peak = boost::starts_with(line, "VmPeak:");
-    bool is_vm_hwm = boost::starts_with(line, "VmHWM:");
-    if (is_vm_peak || is_vm_hwm) {
+    auto it_relevant_stat = std::find_if(
+        relevant_stats.begin(), relevant_stats.end(),
+        [&line](const auto& rs) { return boost::starts_with(line, rs.first); });
+
+    if (it_relevant_stat != relevant_stats.end()) {
+      auto& [stat_name, stat_field_ptr] = *it_relevant_stat;
+
       std::smatch match;
       bool matched = std::regex_match(line, match, re);
       if (!matched) {
@@ -278,12 +318,9 @@ VmStats get_mem_stats() {
         continue;
       }
 
-      if (is_vm_peak) {
-        res.vm_peak = val;
-      } else {
-        res.vm_hwm = val;
-      }
-      if (res.vm_peak != 0 && res.vm_hwm != 0) {
+      *stat_field_ptr = val;
+      if (std::all_of(relevant_stats.begin(), relevant_stats.end(),
+                      [](const auto& rs) { return *rs.second != 0; })) {
         break;
       }
     }

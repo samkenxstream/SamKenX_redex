@@ -6,6 +6,7 @@
  */
 
 #include <boost/thread/once.hpp>
+#include <fstream>
 #include <gtest/gtest.h>
 #include <json/json.h>
 #include <unordered_set>
@@ -84,20 +85,6 @@ class InstructionSequenceOutlinerTest : public RedexIntegrationTest {
 
   void run_passes(const std::vector<Pass*>& passes) {
     RedexIntegrationTest::run_passes(passes, nullptr, m_cfg);
-  }
-
-  void SetUp() override {
-    reset_ab_experiments_global_state();
-
-    std::string config =
-        "{\"ab_experiments_states\":{\"outliner_v1\":\"test\"}}";
-    Json::Value json_conf;
-    std::istringstream temp_json(config);
-
-    temp_json >> json_conf;
-
-    ConfigFiles conf_files(json_conf);
-    ab_test::ABExperimentContext::parse_experiments_states(conf_files, false);
   }
 
  private:
@@ -1038,9 +1025,9 @@ TEST_F(InstructionSequenceOutlinerTest, check_positions) {
   // methods (whick invoke the outlined method) when reuse
   // the outlined method across the dex.
   std::vector<DexMethod*> methods;
-  std::set<std::string> method_names{"basic1", "basic2",     "basic3",
-                                     "basic4", "in_try",     "twice1",
-                                     "twice2", "secondary1", "secondary2"};
+  std::set<std::string_view> method_names{"basic1", "basic2",     "basic3",
+                                          "basic4", "in_try",     "twice1",
+                                          "twice2", "secondary1", "secondary2"};
   for (auto iter_store = stores.begin(); iter_store != stores.end();
        ++iter_store) {
     const auto& dex = iter_store->get_dexen();

@@ -69,6 +69,7 @@ enum Reason {
   UNSAFE_INVOCATION_ON_CANDIDATE_ENUM = 9,
   IFIELD_SET_OUTSIDE_INIT = 10,
   CAST_ENUM_ARRAY_TO_OBJECT = 11,
+  USED_IN_INSTANCE_OF = 12,
 };
 
 /**
@@ -115,6 +116,9 @@ class EnumUpcastDetector {
     } break;
     case OPCODE_CONST_CLASS:
       reject(insn, insn->get_type(), rejected_enums, USED_AS_CLASS_OBJECT);
+      break;
+    case OPCODE_INSTANCE_OF:
+      reject(insn, insn->get_type(), rejected_enums, USED_IN_INSTANCE_OF);
       break;
     case OPCODE_INVOKE_INTERFACE:
     case OPCODE_INVOKE_SUPER:
@@ -592,16 +596,16 @@ void EnumFixpointIterator::analyze_instruction(const IRInstruction* insn,
  */
 EnumTypeEnvironment EnumFixpointIterator::gen_env(const DexMethod* method) {
   EnumTypeEnvironment env;
-  const auto code = method->get_code()->get_param_instructions();
+  const auto params = method->get_code()->cfg().get_param_instructions();
   const DexTypeList* args = method->get_proto()->get_args();
   const bool has_this_pointer = !is_static(method);
   size_t load_param_inst_size = 0;
-  for (const auto& mie ATTRIBUTE_UNUSED : InstructionIterable(code)) {
+  for (const auto& mie ATTRIBUTE_UNUSED : InstructionIterable(params)) {
     ++load_param_inst_size;
   }
   always_assert(load_param_inst_size == args->size() + has_this_pointer);
 
-  auto iterable = InstructionIterable(code);
+  auto iterable = InstructionIterable(params);
   auto it = iterable.begin();
   if (has_this_pointer) { // Has this pointer
     env.set(it->insn->dest(), EnumTypes(method->get_class()));
@@ -700,8 +704,8 @@ void reject_unsafe_enums(const std::vector<DexClass*>& classes,
       });
 
   walk::parallel::methods(classes, [&](DexMethod* method) {
-    // When doing static analysis, simply skip some javac-generated enum methods
-    // <init>, values(), and valueOf(String).
+    // When doing static analysis, simply skip some javac-generated enum
+    // methods <init>, values(), and valueOf(String).
     if (candidate_enums->count_unsafe(method->get_class()) &&
         !rejected_enums.count(method->get_class()) &&
         (method::is_init(method) || is_enum_values(method) ||
@@ -709,36 +713,45 @@ void reject_unsafe_enums(const std::vector<DexClass*>& classes,
       return;
     }
 
-    if (!can_rename(method)) {
+    auto reject_proto_types = [&](DexMethod* method) {
       std::vector<DexType*> types;
       method->get_proto()->gather_types(types);
       for (auto type : types) {
         auto elem_type =
             const_cast<DexType*>(type::get_element_type_if_array(type));
         if (candidate_enums->count_unsafe(elem_type)) {
+          TRACE(ENUM, 5,
+                "Rejecting %s due to !can_rename or usage from annotation",
+                SHOW(elem_type));
           rejected_enums.insert(elem_type);
         }
       }
+    };
+
+    if (!can_rename(method)) {
+      reject_proto_types(method);
       if (!is_static(method) &&
           candidate_enums->count_unsafe(method->get_class())) {
         rejected_enums.insert(method->get_class());
       }
     }
 
+    auto method_cls = type_class(method->get_class());
+    if (method_cls != nullptr && is_annotation(method_cls)) {
+      reject_proto_types(method);
+    }
+
     if (!need_analyze(method, *candidate_enums, rejected_enums)) {
       return;
     }
 
+    auto& cfg = method->get_code()->cfg();
     EnumTypeEnvironment env = EnumFixpointIterator::gen_env(method);
-
-    auto* code = method->get_code();
-    code->build_cfg(/* editable */ false);
-    EnumFixpointIterator engine(code->cfg(), *config);
+    EnumFixpointIterator engine(cfg, *config);
     engine.run(env);
 
     EnumUpcastDetector detector(method, config);
-    detector.run(engine, code->cfg(), &rejected_enums);
-    code->clear_cfg();
+    detector.run(engine, cfg, &rejected_enums);
   });
 
   for (DexType* type : rejected_enums) {
@@ -765,7 +778,7 @@ bool is_enum_values(const DexMethodRef* method) {
     return false;
   }
   auto proto = method->get_proto();
-  if (proto->get_args()->size() != 0) {
+  if (!proto->get_args()->empty()) {
     return false;
   }
   return type::get_array_component_type(proto->get_rtype()) ==

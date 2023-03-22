@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <assert.h>
+#include <bitset>
 #include <boost/filesystem.hpp>
 #include <exception>
 #include <fcntl.h>
@@ -49,6 +50,7 @@
 #include "MethodProfiles.h"
 #include "MethodSimilarityOrderer.h"
 #include "Pass.h"
+#include "RedexOptions.h" // For DebugInfoKind
 #include "Resolver.h"
 #include "Sha1.h"
 #include "Show.h"
@@ -157,10 +159,87 @@ std::vector<DexMethod*> GatheredTypes::get_dexmethod_emitlist() {
   return methlist;
 }
 
-void GatheredTypes::sort_dexmethod_emitlist_method_ref_order(
+void GatheredTypes::sort_dexmethod_emitlist_method_similarity_order(
     std::vector<DexMethod*>& lmeth) {
-  MethodSimilarityOrderer similarity_orderer;
-  similarity_orderer.order(lmeth);
+  // We keep "perf sensitive methods" together in front, and only order by
+  // similarity the remaining methods. Here, we consider as "perf sensitive
+  // methods" any methods in a class that...
+  // - is perf sensitive, which in particular includes all classes that are
+  //   ordered by beta maps
+  // - contains methods that contain any profiled methods with a very
+  //   conservative min-appear cut-off.
+  //
+  // This is similar to the exclusions that the InterDex pass applies when
+  // sorting remaining classes for better compression.
+  redex_assert(m_config != nullptr);
+  std::unordered_set<DexType*> perf_sensitive_classes;
+
+  auto& global_config = m_config->get_global_config();
+  MethodProfileOrderingConfig* profiles_config{nullptr};
+  if (global_config.has_config_by_name("method_profile_order")) {
+    profiles_config =
+        global_config.get_config_by_name<MethodProfileOrderingConfig>(
+            "method_profile_order");
+  }
+
+  if (profiles_config != nullptr &&
+      profiles_config->skip_similarity_reordering) {
+    auto& method_profiles = m_config->get_method_profiles();
+    // Some builds might not have method profiles information.
+    if (method_profiles.is_initialized()) {
+      method_profiles::dexmethods_profiled_comparator comparator(
+          lmeth,
+          /*method_profiles=*/&method_profiles,
+          profiles_config);
+
+      for (auto meth : lmeth) {
+        auto method_sort_num = comparator.get_overall_method_sort_num(meth);
+        if (method_sort_num <
+            method_profiles::dexmethods_profiled_comparator::VERY_END) {
+          perf_sensitive_classes.insert(meth->get_class());
+        }
+      }
+    }
+  }
+
+  MethodSimilarityOrderingConfig* similarity_config{nullptr};
+  if (global_config.has_config_by_name("method_similarity_order")) {
+    similarity_config =
+        global_config.get_config_by_name<MethodSimilarityOrderingConfig>(
+            "method_similarity_order");
+  }
+  if (similarity_config != nullptr &&
+      similarity_config->use_class_level_perf_sensitivity) {
+    for (auto meth : lmeth) {
+      auto cls = type_class(meth->get_class());
+      if (!cls->is_perf_sensitive()) {
+        continue;
+      }
+      perf_sensitive_classes.insert(meth->get_class());
+    }
+  }
+
+  std::vector<DexMethod*> perf_sensitive_methods;
+  std::vector<DexMethod*> remaining_methods;
+  for (auto meth : lmeth) {
+    if (perf_sensitive_classes.count(meth->get_class())) {
+      perf_sensitive_methods.push_back(meth);
+    } else {
+      remaining_methods.push_back(meth);
+    }
+  }
+
+  TRACE(
+      OPUT, 2,
+      "Skipping %zu perf sensitive methods, ordering %zu methods by similarity",
+      perf_sensitive_methods.size(), remaining_methods.size());
+  MethodSimilarityOrderer method_similarity_orderer;
+  method_similarity_orderer.order(remaining_methods);
+
+  lmeth.clear();
+  lmeth.insert(lmeth.end(), perf_sensitive_methods.begin(),
+               perf_sensitive_methods.end());
+  lmeth.insert(lmeth.end(), remaining_methods.begin(), remaining_methods.end());
 }
 
 void GatheredTypes::sort_dexmethod_emitlist_default_order(
@@ -189,6 +268,22 @@ void GatheredTypes::sort_dexmethod_emitlist_profiled_order(
       lmeth,
       /*method_profiles=*/&m_config->get_method_profiles(),
       config);
+  std::stable_sort(lmeth.begin(), lmeth.end(), std::ref(comparator));
+}
+
+void GatheredTypes::sort_dexmethod_emitlist_profiled_secondary_order(
+    std::vector<DexMethod*>& lmeth) {
+  redex_assert(m_config != nullptr);
+
+  MethodProfileOrderingConfig* config =
+      m_config->get_global_config()
+          .get_config_by_name<MethodProfileOrderingConfig>(
+              "method_profile_order");
+
+  method_profiles::dexmethods_profiled_secondary_comparator comparator(
+      lmeth, &m_config->get_secondary_method_profiles(), config);
+
+  // Use std::ref to avoid comparator copies.
   std::stable_sort(lmeth.begin(), lmeth.end(), std::ref(comparator));
 }
 
@@ -297,8 +392,7 @@ std::vector<DexTypeList*>* GatheredTypes::get_typelist_list(
     dexproto_to_idx* protos, cmp_dtypelist cmp) {
   std::vector<DexTypeList*>* typel = new std::vector<DexTypeList*>();
   auto class_defs_size = (uint32_t)m_classes->size();
-  typel->reserve(protos->size() + class_defs_size +
-                 m_additional_ltypelists.size());
+  typel->reserve(protos->size() + class_defs_size);
 
   for (auto& it : *protos) {
     auto proto = it.first;
@@ -308,9 +402,6 @@ std::vector<DexTypeList*>* GatheredTypes::get_typelist_list(
     DexClass* clz = m_classes->at(i);
     typel->push_back(clz->get_interfaces());
   }
-  typel->insert(typel->end(),
-                m_additional_ltypelists.begin(),
-                m_additional_ltypelists.end());
   sort_unique(*typel, compare_dextypelists);
   return typel;
 }
@@ -457,6 +548,7 @@ DexOutput::DexOutput(
     LocatorIndex* locator_index,
     bool normal_primary_dex,
     size_t store_number,
+    const std::string* store_name,
     size_t dex_number,
     DebugInfoKind debug_info_kind,
     IODIMetadata* iodi_metadata,
@@ -464,6 +556,7 @@ DexOutput::DexOutput(
     PositionMapper* pos_mapper,
     std::unordered_map<DexMethod*, uint64_t>* method_to_id,
     std::unordered_map<DexCode*, std::vector<DebugLineItem>>* code_debug_lines,
+    const DexOutputConfig& dex_output_config,
     PostLowering* post_lowering,
     int min_sdk)
     : m_classes(classes),
@@ -478,7 +571,8 @@ DexOutput::DexOutput(
       m_offset(0),
       m_iodi_metadata(iodi_metadata),
       m_config_files(config_files),
-      m_min_sdk(min_sdk) {
+      m_min_sdk(min_sdk),
+      m_dex_output_config(dex_output_config) {
   // Ensure a clean slate.
   memset(m_output.get(), 0, m_output_size);
 
@@ -509,6 +603,7 @@ DexOutput::DexOutput(
   m_full_mapping_filename = config_files.metafile(REDEX_FULL_MAPPING);
   m_bytecode_offset_filename = config_files.metafile(BYTECODE_OFFSET_MAPPING);
   m_store_number = store_number;
+  m_store_name = store_name;
   m_dex_number = dex_number;
   m_locator_index = locator_index;
   m_normal_primary_dex = normal_primary_dex;
@@ -931,6 +1026,9 @@ void DexOutput::generate_class_data_items() {
     if (!clz->has_class_data()) continue;
     /* No alignment constraints for this data */
     int size = clz->encode(m_dodx.get(), dco, m_output.get() + m_offset);
+    if (m_dex_output_config.write_class_sizes) {
+      m_stats.class_size[clz] = size;
+    }
     cdefs[i].class_data_offset = m_offset;
     inc_offset(size);
     count += 1;
@@ -983,14 +1081,18 @@ void DexOutput::generate_code_items(const std::vector<SortMode>& mode) {
             "sorting <clinit> sections before all other bytecode");
       m_gtypes->sort_dexmethod_emitlist_clinit_order(lmeth);
       break;
-
     case SortMode::CLASS_STRINGS:
       TRACE(CUSTOMSORT, 2,
             "Unsupport bytecode sorting method SortMode::CLASS_STRINGS");
       break;
     case SortMode::METHOD_SIMILARITY:
-      TRACE(CUSTOMSORT, 2, "using method refs order");
-      m_gtypes->sort_dexmethod_emitlist_method_ref_order(lmeth);
+      TRACE(CUSTOMSORT, 2, "using method similarity order");
+      m_gtypes->sort_dexmethod_emitlist_method_similarity_order(lmeth);
+      break;
+    case SortMode::METHOD_PROFILED_SECONDARY_ORDER:
+      TRACE(CUSTOMSORT, 2,
+            "using method profiled secondary order for bytecode sorting");
+      m_gtypes->sort_dexmethod_emitlist_profiled_secondary_order(lmeth);
       break;
     case SortMode::DEFAULT:
       TRACE(CUSTOMSORT, 2, "using default sorting order");
@@ -1116,15 +1218,14 @@ void DexOutput::generate_static_values() {
     for (uint32_t i = 0; i < callsites.size(); i++) {
       auto callsite = callsites[i];
       auto eva = callsite->as_encoded_value_array();
-      uint32_t offset;
       if (enc_arrays.count(eva)) {
-        offset = m_call_site_items[callsite] = enc_arrays.at(eva);
+        m_call_site_items[callsite] = enc_arrays.at(eva);
       } else {
         uint8_t* output = m_output.get() + m_offset;
         uint8_t* outputsv = output;
         eva.encode(m_dodx.get(), output);
         enc_arrays.emplace(std::move(eva), m_offset);
-        offset = m_call_site_items[callsite] = m_offset;
+        m_call_site_items[callsite] = m_offset;
         inc_offset(output - outputsv);
         m_stats.num_static_values++;
       }
@@ -1277,9 +1378,6 @@ void DexOutput::generate_annotations() {
    * 5) Attach annotation_directories to the classdefs
    */
   std::vector<DexAnnotationDirectory*> lad;
-  int xrefsize = 0;
-  int annodirsize = 0;
-  int xrefcnt = 0;
   std::map<DexAnnotationDirectory*, int> ad_to_classnum;
   annomap_t annomap;
   asetmap_t asetmap;
@@ -1290,9 +1388,6 @@ void DexOutput::generate_annotations() {
     DexClass* clz = m_classes->at(i);
     DexAnnotationDirectory* ad = clz->get_annotation_directory();
     if (ad) {
-      xrefsize += ad->xref_size();
-      annodirsize += ad->annodir_size();
-      xrefcnt += ad->xref_count();
       lad.push_back(ad);
       ad_to_classnum[ad] = i;
     }
@@ -1466,7 +1561,7 @@ struct ParamSizeOrder {
   }
 };
 
-uint32_t emit_instruction_offset_debug_info(
+uint32_t emit_instruction_offset_debug_info_helper(
     DexOutputIdx* dodx,
     PositionMapper* pos_mapper,
     std::vector<CodeItemEmit*>& code_items,
@@ -1496,14 +1591,11 @@ uint32_t emit_instruction_offset_debug_info(
   // method. Hopefully no debug program is > 128k. Its ok to increase this
   // in the future.
   constexpr int TMP_SIZE = 128 * 1024;
-  uint8_t* tmp = (uint8_t*)malloc(TMP_SIZE);
+  auto temporary_buffer = std::make_unique<uint8_t[]>(TMP_SIZE);
+  uint8_t* tmp = temporary_buffer.get();
   std::unordered_map<const DexMethod*, std::vector<const DexMethod*>>
       clustered_methods;
-  // Returns whether this is in a cluster, period, not a "current" cluster in
-  // this iteration.
-  auto is_in_global_cluster = [&](const DexMethod* method) {
-    return iodi_metadata.get_cluster(method).size() > 1;
-  };
+
   for (auto& it : code_items) {
     DexCode* dc = it->code;
     const auto dbg_item = dc->get_debug_item();
@@ -1532,12 +1624,12 @@ uint32_t emit_instruction_offset_debug_info(
                                                   debug_size);
     always_assert_log(res.second, "Failed to insert %s, %d pair", SHOW(method),
                       dc->size());
-    if (is_in_global_cluster(method)) {
+    if (iodi_metadata.is_in_global_cluster(method)) {
       clustered_methods[iodi_metadata.get_canonical_method(method)].push_back(
           method);
     }
   }
-  free((void*)tmp);
+  temporary_buffer = nullptr;
 
   std20::erase_if(clustered_methods,
                   [](auto& p) { return p.second.size() <= 1; });
@@ -2121,7 +2213,7 @@ uint32_t emit_instruction_offset_debug_info(
       //       versions for all of them.
       DebugMetadata no_line_addin_metadata;
       const DebugMetadata* metadata = &method_to_debug_meta.at(method);
-      if (!is_in_global_cluster(method) && line_addin != 0) {
+      if (!iodi_metadata.is_in_global_cluster(method) && line_addin != 0) {
         no_line_addin_metadata =
             calculate_debug_metadata(dbg, dc, it->code_item, pos_mapper,
                                      metadata->num_params, code_debug_map,
@@ -2162,16 +2254,10 @@ uint32_t emit_instruction_offset_debug_info(
   // be encoded.
   const size_t large_bound = iodi_layers ? DexOutput::kIODILayerBound : 1;
 
-  std::unordered_set<const DexMethod*> too_large_cluster_methods;
-  {
-    for (const auto& p : iodi_metadata.get_name_clusters()) {
-      if (p.second.size() > large_bound) {
-        too_large_cluster_methods.insert(p.second.begin(), p.second.end());
-      }
-    }
-  }
-  TRACE(IODI, 1, "%zu methods in too-large clusters.",
-        too_large_cluster_methods.size());
+  const auto& too_large_cluster_canonical_methods =
+      iodi_metadata.get_too_large_cluster_canonical_methods();
+  TRACE(IODI, 1, "%zu too-large method clusters.",
+        too_large_cluster_canonical_methods.size());
 
   std::vector<CodeItemEmit*> code_items_tmp;
   code_items_tmp.reserve(code_items.size());
@@ -2198,18 +2284,20 @@ uint32_t emit_instruction_offset_debug_info(
         code_items.size() - code_items_tmp.size());
   // Remove all unsupported items.
   std::vector<CodeItemEmit*> unsupported_code_items;
-  if (!too_large_cluster_methods.empty()) {
+  if (!too_large_cluster_canonical_methods.empty()) {
     code_items_tmp.erase(
-        std::remove_if(code_items_tmp.begin(), code_items_tmp.end(),
-                       [&](CodeItemEmit* cie) {
-                         bool supported =
-                             too_large_cluster_methods.count(cie->method) == 0;
-                         if (!supported) {
-                           iodi_metadata.mark_method_huge(cie->method);
-                           unsupported_code_items.push_back(cie);
-                         }
-                         return !supported;
-                       }),
+        std::remove_if(
+            code_items_tmp.begin(), code_items_tmp.end(),
+            [&](CodeItemEmit* cie) {
+              bool supported =
+                  too_large_cluster_canonical_methods.count(
+                      iodi_metadata.get_canonical_method(cie->method)) == 0;
+              if (!supported) {
+                iodi_metadata.mark_method_huge(cie->method);
+                unsupported_code_items.push_back(cie);
+              }
+              return !supported;
+            }),
         code_items_tmp.end());
   }
 
@@ -2221,7 +2309,7 @@ uint32_t emit_instruction_offset_debug_info(
       }
       TRACE(IODI, 1, "IODI iteration %zu", i);
       const size_t before_size = code_items_tmp.size();
-      offset += emit_instruction_offset_debug_info(
+      offset += emit_instruction_offset_debug_info_helper(
           dodx, pos_mapper, code_items_tmp, iodi_metadata, i,
           i << DexOutput::kIODILayerShift, store_number, dex_number, output,
           offset, dbgcount, code_debug_map);
@@ -2513,7 +2601,7 @@ void write_method_mapping(const std::string& filename,
     auto deobf_class = [&] {
       if (cls) {
         auto deobname = cls->get_deobfuscated_name_or_empty();
-        if (!deobname.empty()) return deobname;
+        if (!deobname.empty()) return str_copy(deobname);
       }
       return show(typecls);
     }();
@@ -2537,7 +2625,7 @@ void write_method_mapping(const std::string& filename,
         const auto& deobfname =
             resolved_method->as_def()->get_deobfuscated_name_or_empty();
         if (!deobfname.empty()) {
-          return deobfname;
+          return str_copy(deobfname);
         }
       }
       return show(resolved_method);
@@ -2573,7 +2661,7 @@ void write_class_mapping(const std::string& filename,
     auto deobf_class = [&] {
       if (cls) {
         auto deobname = cls->get_deobfuscated_name_or_empty();
-        if (!deobname.empty()) return deobname;
+        if (!deobname.empty()) return str_copy(deobname);
       }
       return show(cls);
     }();
@@ -2623,7 +2711,7 @@ void write_pg_mapping(
   auto deobf_class = [&](DexClass* cls) {
     if (cls) {
       auto deobname = cls->get_deobfuscated_name_or_empty();
-      if (!deobname.empty()) return deobname;
+      if (!deobname.empty()) return str_copy(deobname);
     }
     return show(cls);
   };
@@ -2658,7 +2746,7 @@ void write_pg_mapping(
         } else if (type::is_primitive(type)) {
           return std::string(deobf_primitive(type->c_str()[0]));
         } else {
-          return java_names::internal_to_external(type->c_str());
+          return java_names::internal_to_external(type->str());
         }
       }
     }
@@ -2729,7 +2817,7 @@ void write_pg_mapping(
   for (auto cls : *classes) {
     auto deobf_cls = deobf_class(cls);
     ofs << java_names::internal_to_external(deobf_cls) << " -> "
-        << java_names::internal_to_external(cls->get_type()->c_str()) << ":"
+        << java_names::internal_to_external(cls->get_type()->str()) << ":"
         << std::endl;
     for (auto field : cls->get_ifields()) {
       auto deobf = deobf_field(field);
@@ -2760,13 +2848,20 @@ void write_pg_mapping(
   }
 }
 
-void write_full_mapping(const std::string& filename, DexClasses* classes) {
+void write_full_mapping(const std::string& filename,
+                        DexClasses* classes,
+                        const std::string* store_name) {
   if (filename.empty()) return;
 
   std::ofstream ofs(filename.c_str(), std::ofstream::out | std::ofstream::app);
   for (auto cls : *classes) {
     ofs << "type " << cls->get_deobfuscated_name_or_empty() << " -> "
         << show(cls) << std::endl;
+    if (store_name) {
+      const auto& original_store_name = cls->get_location()->get_store_name();
+      ofs << "store " << std::quoted(original_store_name) << " -> "
+          << std::quoted(*store_name) << std::endl;
+    }
     for (auto field : cls->get_ifields()) {
       ofs << "ifield " << field->get_deobfuscated_name_or_empty() << " -> "
           << show(field) << std::endl;
@@ -2815,7 +2910,7 @@ void DexOutput::write_symbol_files() {
     // XXX: should write_bytecode_offset_mapping be included here too?
   }
   write_pg_mapping(m_pg_mapping_filename, m_classes, &m_detached_methods);
-  write_full_mapping(m_full_mapping_filename, m_classes);
+  write_full_mapping(m_full_mapping_filename, m_classes, m_store_name);
   write_bytecode_offset_mapping(m_bytecode_offset_filename,
                                 m_method_bytecode_offsets);
 }
@@ -2943,28 +3038,31 @@ static SortMode make_sort_bytecode(const std::string& sort_bytecode) {
     return SortMode::METHOD_PROFILED_ORDER;
   } else if (sort_bytecode == "method_similarity_order") {
     return SortMode::METHOD_SIMILARITY;
+  } else if (sort_bytecode == "method_profiled_secondary_order") {
+    return SortMode::METHOD_PROFILED_SECONDARY_ORDER;
   } else {
     return SortMode::DEFAULT;
   }
 }
 
-dex_stats_t write_classes_to_dex(
-    const RedexOptions& redex_options,
+enhanced_dex_stats_t write_classes_to_dex(
     const std::string& filename,
     DexClasses* classes,
     std::shared_ptr<GatheredTypes> gtypes,
     LocatorIndex* locator_index,
     size_t store_number,
+    const std::string* store_name,
     size_t dex_number,
     ConfigFiles& conf,
     PositionMapper* pos_mapper,
+    DebugInfoKind debug_info_kind,
     std::unordered_map<DexMethod*, uint64_t>* method_to_id,
     std::unordered_map<DexCode*, std::vector<DebugLineItem>>* code_debug_lines,
     IODIMetadata* iodi_metadata,
     const std::string& dex_magic,
+    const DexOutputConfig& dex_output_config,
     PostLowering* post_lowering,
-    int min_sdk,
-    bool disable_method_similarity_order) {
+    int min_sdk) {
   const JsonWrapper& json_cfg = conf.get_json_config();
   bool force_single_dex = json_cfg.get("force_single_dex", false);
   if (force_single_dex) {
@@ -2991,7 +3089,15 @@ dex_stats_t write_classes_to_dex(
       code_sort_mode.push_back(make_sort_bytecode(val.asString()));
     }
   }
-  if (disable_method_similarity_order) {
+
+  MethodSimilarityOrderingConfig* similarity_config{nullptr};
+  auto& global_config = conf.get_global_config();
+  if (global_config.has_config_by_name("method_similarity_order")) {
+    similarity_config =
+        global_config.get_config_by_name<MethodSimilarityOrderingConfig>(
+            "method_similarity_order");
+  }
+  if (similarity_config == nullptr || similarity_config->disable) {
     TRACE(OPUT, 3, "[write_classes_to_dex] disable_method_similarity_order");
     code_sort_mode.erase(
         std::remove_if(
@@ -3006,9 +3112,9 @@ dex_stats_t write_classes_to_dex(
   TRACE(OPUT, 2, "[write_classes_to_dex][filename] %s", filename.c_str());
 
   DexOutput dout(filename.c_str(), classes, std::move(gtypes), locator_index,
-                 normal_primary_dex, store_number, dex_number,
-                 redex_options.debug_info_kind, iodi_metadata, conf, pos_mapper,
-                 method_to_id, code_debug_lines, post_lowering, min_sdk);
+                 normal_primary_dex, store_number, store_name, dex_number,
+                 debug_info_kind, iodi_metadata, conf, pos_mapper, method_to_id,
+                 code_debug_lines, dex_output_config, post_lowering, min_sdk);
 
   dout.prepare(string_sort_mode, code_sort_mode, conf, dex_magic);
   dout.write();
@@ -3044,8 +3150,9 @@ LocatorIndex make_locator_index(DexStoresVector& stores) {
                                 clsname, Locator::make(strnr, dexnr, clsnr)))
                             .second;
         // We shouldn't see the same class defined in two dexen
-        always_assert_log(inserted, "This was already inserted %s\n",
-                          (*clsit)->get_deobfuscated_name_or_empty().c_str());
+        always_assert_log(
+            inserted, "This was already inserted %s\n",
+            (*clsit)->get_deobfuscated_name_or_empty_copy().c_str());
         (void)inserted; // Shut up compiler when defined(NDEBUG)
       }
     }

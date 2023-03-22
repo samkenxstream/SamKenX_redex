@@ -278,6 +278,9 @@ class DelSuper {
   void run(bool do_delete, PassManager& mgr) {
     walk::methods(m_scope, [&](DexMethod* meth) {
       m_num_methods++;
+      if (root(meth)) {
+        return;
+      }
       auto invoked_meth = get_trivial_return_invoke_super(meth);
       if (invoked_meth) {
         TRACE(SUPER, 5, "Found trivial return invoke-super: %s", SHOW(meth));
@@ -311,6 +314,7 @@ class DelSuper {
         always_assert(meth->is_virtual());
         clazz->remove_method(meth);
         DexMethod::erase_method(meth);
+        DexMethod::delete_method(meth);
         TRACE(SUPER, 5, "Deleted trivial return invoke-super: %s", SHOW(meth));
       }
     }

@@ -69,6 +69,8 @@ void set_sfields_in_partition(const DexClass* cls,
     }
     auto domain = env.get(field);
     if (!domain.is_top()) {
+      // Mark sfields as nullable
+      domain.join_with(DexTypeDomain::null());
       TRACE(TYPE, 5, "%s has type %s after <clinit>", SHOW(field),
             SHOW(domain));
       always_assert(field->get_class() == cls->get_type());
@@ -95,6 +97,8 @@ void set_ifields_in_partition(const DexClass* cls,
     }
     auto domain = env.get(field);
     if (!domain.is_top()) {
+      // Mark ifields as nullable
+      domain.join_with(DexTypeDomain::null());
       TRACE(TYPE, 5, "%s has type %s after <init>", SHOW(field), SHOW(domain));
       always_assert(field->get_class() == cls->get_type());
     } else {
@@ -171,8 +175,9 @@ std::string WholeProgramState::show_method(const DexMethod* m) {
 void WholeProgramState::setup_known_method_returns() {
   for (auto& p : STATIC_METHOD_TO_TYPE_MAP) {
     auto method = DexMethod::make_method(p.first);
-    auto type = DexTypeDomain(
-        DexType::make_type(DexString::make_string(p.second)), NOT_NULL);
+    auto type =
+        DexTypeDomain(DexType::make_type(DexString::make_string(p.second)),
+                      NOT_NULL, /* is_dex_type_exact */ true);
     m_known_method_returns.insert(std::make_pair(method, type));
   }
 }
@@ -206,7 +211,7 @@ void WholeProgramState::analyze_clinits_and_ctors(
       IRCode* code = clinit->get_code();
       auto& cfg = code->cfg();
       auto lta = gta.get_local_analysis(clinit);
-      auto env = lta->get_exit_state_at(cfg.exit_block());
+      const auto& env = lta->get_exit_state_at(cfg.exit_block());
       set_sfields_in_partition(cls, env, field_partition);
     } else {
       set_sfields_in_partition(cls, DexTypeEnvironment::top(), field_partition);
@@ -220,7 +225,7 @@ void WholeProgramState::analyze_clinits_and_ctors(
       IRCode* code = ctor->get_code();
       auto& cfg = code->cfg();
       auto lta = gta.get_local_analysis(ctor);
-      auto env = lta->get_exit_state_at(cfg.exit_block());
+      const auto& env = lta->get_exit_state_at(cfg.exit_block());
       set_ifields_in_partition(cls, env, field_partition);
     }
   }
@@ -313,6 +318,12 @@ void WholeProgramState::collect_return_types(
     return;
   }
   auto type = env.get(insn->src(0));
+  if (traceEnabled(TYPE, 5)) {
+    std::ostringstream ss;
+    ss << type;
+    TRACE(TYPE, 5, "collecting method %s -> %s", SHOW(method),
+          ss.str().c_str());
+  }
   method_tmp->update(method,
                      [type](const DexMethod*,
                             std::vector<DexTypeDomain>& s,

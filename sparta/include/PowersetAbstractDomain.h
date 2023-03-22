@@ -16,6 +16,13 @@
 #include "AbstractDomain.h"
 
 namespace sparta {
+namespace pad_impl {
+template <typename Element,
+          typename Powerset,
+          typename Snapshot,
+          typename Derived>
+class PowersetAbstractDomainStaticAssert;
+} // namespace pad_impl
 
 /*
  * The definition of an abstract value belonging to a powerset abstract domain.
@@ -35,6 +42,7 @@ class PowersetImplementation : public AbstractValue<Derived> {
   virtual bool contains(const Element& e) const = 0;
 
   virtual void add(const Element& e) = 0;
+  virtual void add(Element&& e) = 0;
 
   virtual void remove(const Element& e) = 0;
 
@@ -68,23 +76,12 @@ template <typename Element,
           typename Snapshot,
           typename Derived>
 class PowersetAbstractDomain
-    : public AbstractDomainScaffolding<Powerset, Derived> {
+    : public AbstractDomainScaffolding<Powerset, Derived>,
+      private pad_impl::PowersetAbstractDomainStaticAssert<Element,
+                                                           Powerset,
+                                                           Snapshot,
+                                                           Derived> {
  public:
-  virtual ~PowersetAbstractDomain() {
-    // The destructor is the only method that is guaranteed to be created when a
-    // class template is instantiated. This is a good place to perform all the
-    // sanity checks on the template parameters.
-    static_assert(
-        std::is_base_of<PowersetImplementation<Element, Snapshot, Powerset>,
-                        Powerset>::value,
-        "Powerset doesn't inherit from PowersetImplementation");
-    static_assert(
-        std::is_base_of<
-            PowersetAbstractDomain<Element, Powerset, Snapshot, Derived>,
-            Derived>::value,
-        "Derived doesn't inherit from PowersetAbstractDomain");
-  }
-
   /*
    * This constructor produces the empty set, which is distinct from Bottom.
    */
@@ -112,6 +109,12 @@ class PowersetAbstractDomain
   void add(const Element& e) {
     if (this->kind() == AbstractValueKind::Value) {
       this->get_value()->add(e);
+    }
+  }
+
+  void add(Element&& e) {
+    if (this->kind() == AbstractValueKind::Value) {
+      this->get_value()->add(std::move(e));
     }
   }
 
@@ -200,5 +203,28 @@ class PowersetAbstractDomain
     return o;
   }
 };
+
+namespace pad_impl {
+
+template <typename Element,
+          typename Powerset,
+          typename Snapshot,
+          typename Derived>
+class PowersetAbstractDomainStaticAssert {
+ protected:
+  ~PowersetAbstractDomainStaticAssert() {
+    static_assert(
+        std::is_base_of_v<PowersetImplementation<Element, Snapshot, Powerset>,
+                          Powerset>,
+        "Powerset doesn't inherit from PowersetImplementation");
+    static_assert(
+        std::is_base_of_v<
+            PowersetAbstractDomain<Element, Powerset, Snapshot, Derived>,
+            Derived>,
+        "Derived doesn't inherit from PowersetAbstractDomain");
+  }
+};
+
+} // namespace pad_impl
 
 } // namespace sparta

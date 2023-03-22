@@ -9,6 +9,7 @@
 
 #include "BaseIRAnalyzer.h"
 #include "ConstantEnvironment.h"
+#include "EnumClinitAnalysis.h"
 #include "IRCode.h"
 #include "Resolver.h"
 
@@ -148,13 +149,14 @@ OptimizeEnumsAnalysis::OptimizeEnumsAnalysis(
     const DexClass* enum_cls,
     const std::unordered_map<const DexMethod*, uint32_t>& ctor_to_arg_ordinal)
     : m_cls(enum_cls) {
-  auto clinit = enum_cls->get_clinit();
+  auto clinit = m_cls->get_clinit();
   always_assert(clinit && clinit->get_code());
+  auto& clinit_cfg = clinit->get_code()->cfg();
+  always_assert(clinit_cfg.editable());
 
-  m_clinit_cfg = cfg::ScopedCFG(clinit->get_code());
-  m_clinit_cfg->calculate_exit_block();
+  clinit_cfg.calculate_exit_block();
   m_analyzer = std::make_unique<impl::Analyzer>(
-      *m_clinit_cfg, ctor_to_arg_ordinal, enum_cls);
+      clinit_cfg, ctor_to_arg_ordinal, enum_cls);
 }
 
 /**
@@ -163,24 +165,32 @@ OptimizeEnumsAnalysis::OptimizeEnumsAnalysis(
  */
 void OptimizeEnumsAnalysis::collect_ordinals(
     std::unordered_map<DexField*, size_t>& enum_field_to_ordinal) {
-  auto env = m_analyzer->get_exit_state_at(m_clinit_cfg->exit_block());
+  auto& clinit_cfg = m_cls->get_clinit()->get_code()->cfg();
+  const auto& env = m_analyzer->get_exit_state_at(clinit_cfg.exit_block());
 
+  // There may be static fields of the enum type that are not the
+  // enum variants, but simply aliases. These don't have unique
+  // ordinals to worry about and won't have the ENUM access flag.
   bool are_all_ordinals_determined = true;
-  for (const auto& sfield : m_cls->get_sfields()) {
-    if (sfield->get_type() == m_cls->get_type()) {
-      auto cst = env.get<SignedConstantDomain>(sfield).get_constant();
-      if (!cst) {
-        are_all_ordinals_determined = false;
-        break;
-      }
-
-      enum_field_to_ordinal[sfield] = *cst;
+  for (DexField* sfield : m_cls->get_sfields()) {
+    if (sfield->get_type() != m_cls->get_type() ||
+        !check_required_access_flags(optimize_enums::enum_field_access(),
+                                     sfield->get_access())) {
+      continue;
     }
+
+    auto cst = env.get<SignedConstantDomain>(sfield).get_constant();
+    if (!cst) {
+      are_all_ordinals_determined = false;
+      break;
+    }
+
+    enum_field_to_ordinal[sfield] = *cst;
   }
 
   // If not all ordinals were properly determined, cleanup.
   if (!are_all_ordinals_determined) {
-    for (const auto& sfield : m_cls->get_sfields()) {
+    for (DexField* sfield : m_cls->get_sfields()) {
       enum_field_to_ordinal.erase(sfield);
     }
   }

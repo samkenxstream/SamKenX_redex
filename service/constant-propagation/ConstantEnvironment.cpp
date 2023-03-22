@@ -7,28 +7,6 @@
 
 #include "ConstantEnvironment.h"
 
-int64_t SignedConstantDomain::max_element() const {
-  if (constant_domain().is_value()) {
-    return *constant_domain().get_constant();
-  }
-  auto max = numeric_interval_domain().upper_bound();
-  if (max < NumericIntervalDomain::MAX) {
-    return max;
-  }
-  return sign_domain::max_int(interval());
-}
-
-int64_t SignedConstantDomain::min_element() const {
-  if (constant_domain().is_value()) {
-    return *constant_domain().get_constant();
-  }
-  auto min = numeric_interval_domain().lower_bound();
-  if (min > NumericIntervalDomain::MIN) {
-    return min;
-  }
-  return sign_domain::min_int(interval());
-}
-
 // TODO: Instead of this custom meet function, the ConstantValue should get a
 // custom meet AND JOIN that knows about the relationship of NEZ and certain
 // non-null custom object domains.
@@ -55,18 +33,18 @@ ConstantValue meet(const ConstantValue& left, const ConstantValue& right) {
   // references and they have intersection.
   // Handle their meet operator specially.
   auto is_singleton_obj = [](const ConstantValue& value) {
-    auto obj = value.maybe_get<SingletonObjectDomain>();
-    return obj;
+    return !value.is_top() && !value.is_bottom() &&
+           value.maybe_get<SingletonObjectDomain>();
   };
   auto is_obj_with_immutable_attr = [](const ConstantValue& value) {
-    auto obj = value.maybe_get<ObjectWithImmutAttrDomain>();
-    return obj;
+    return !value.is_top() && !value.is_bottom() &&
+           value.maybe_get<ObjectWithImmutAttrDomain>();
   };
   if (is_singleton_obj(left) && is_obj_with_immutable_attr(right)) {
-    return right;
+    return ConstantValue::top();
   }
   if (is_singleton_obj(right) && is_obj_with_immutable_attr(left)) {
-    return left;
+    return ConstantValue::top();
   }
   // Non-null objects of different custom object domains can never alias, so
   // they meet at bottom, which is the default meet implementation for

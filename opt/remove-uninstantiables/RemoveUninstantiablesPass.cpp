@@ -13,6 +13,7 @@
 #include "ControlFlow.h"
 #include "DexUtil.h"
 #include "IRCode.h"
+#include "MethodDedup.h"
 #include "NullPointerExceptionUtil.h"
 #include "PassManager.h"
 #include "Resolver.h"
@@ -109,7 +110,8 @@ class OverriddenVirtualScopesAnalysis {
     }
     auto& res = m_transitively_defined_virtual_scopes[t];
     if (is_instantiated(t)) {
-      auto own_defined_virtual_scopes = defined_virtual_scopes.at_unsafe(t);
+      const auto& own_defined_virtual_scopes =
+          defined_virtual_scopes.at_unsafe(t);
       res.insert(own_defined_virtual_scopes.begin(),
                  own_defined_virtual_scopes.end());
       return;
@@ -117,11 +119,11 @@ class OverriddenVirtualScopesAnalysis {
     std::unordered_map<VirtualScopeId, size_t, VirtualScopeIdHasher> counted;
     auto children_it = instantiable_children.find(t);
     if (children_it != instantiable_children.end()) {
-      auto& children = children_it->second;
+      const auto& children = children_it->second;
       for (auto child : children) {
-        auto& defined_virtual_scopes_of_child =
+        const auto& defined_virtual_scopes_of_child =
             defined_virtual_scopes.at_unsafe(child);
-        for (auto& virtual_scope : defined_virtual_scopes_of_child) {
+        for (const auto& virtual_scope : defined_virtual_scopes_of_child) {
           counted[virtual_scope]++;
         }
         compute_transitively_defined_virtual_scope(
@@ -197,7 +199,8 @@ class OverriddenVirtualScopesAnalysis {
         VirtualScopeId virtual_scope = VirtualScopeId::make(method);
         virtual_scopes.emplace(virtual_scope);
       }
-      defined_virtual_scopes.emplace(cls->get_type(), virtual_scopes);
+      defined_virtual_scopes.emplace(cls->get_type(),
+                                     std::move(virtual_scopes));
     });
 
     for (auto cls : scope) {
@@ -243,6 +246,7 @@ RemoveUninstantiablesPass::Stats& RemoveUninstantiablesPass::Stats::operator+=(
   this->abstracted_vmethods += that.abstracted_vmethods;
   this->removed_vmethods += that.removed_vmethods;
   this->get_uninstantiables += that.get_uninstantiables;
+  this->invoke_uninstantiables += that.invoke_uninstantiables;
   this->check_casts += that.check_casts;
   return *this;
 }
@@ -272,6 +276,7 @@ void RemoveUninstantiablesPass::Stats::report(PassManager& mgr) const {
   REPORT(abstracted_vmethods);
   REPORT(removed_vmethods);
   REPORT(get_uninstantiables);
+  REPORT(invoke_uninstantiables);
   REPORT(check_casts);
 
 #undef REPORT
@@ -306,12 +311,8 @@ RemoveUninstantiablesPass::compute_scoped_uninstantiable_types(
     return false;
   };
   walk::classes(scope, [&](const DexClass* cls) {
-    if (type::is_uninstantiable_class(cls->get_type())) {
-      uninstantiable_types.insert(cls->get_type());
-    } else if (is_interface(cls) && !is_interface_instantiable(cls)) {
-      uninstantiable_types.insert(cls->get_type());
-    } else if (is_abstract(cls) && !is_interface(cls) && !cls->is_external() &&
-               !is_native(cls) && !root(cls)) {
+    if (type::is_uninstantiable_class(cls->get_type()) ||
+        (is_interface(cls) && !is_interface_instantiable(cls))) {
       uninstantiable_types.insert(cls->get_type());
     } else {
       instantiable_classes.insert(cls);
@@ -412,6 +413,18 @@ RemoveUninstantiablesPass::replace_uninstantiable_refs(
       auto dest = cfg.move_result_of(it)->insn->dest();
       m.replace(it, {ir_const(dest, 0)});
       stats.get_uninstantiables++;
+      continue;
+    }
+
+    if (opcode::is_an_invoke(op) &&
+        scoped_uninstantiable_types.count(
+            insn->get_method()->get_proto()->get_rtype())) {
+      auto move_result_it = cfg.move_result_of(it);
+      if (!move_result_it.is_end()) {
+        auto dest = move_result_it->insn->dest();
+        m.replace(move_result_it, {ir_const(dest, 0)});
+        stats.invoke_uninstantiables++;
+      }
       continue;
     }
   }
@@ -532,38 +545,14 @@ void RemoveUninstantiablesPass::run_pass(DexStoresVector& stores,
                           [&class_post_processing](DexClass* cls) {
                             auto& cpp = class_post_processing.at_unsafe(cls);
                             for (auto& p : cpp.remove_vmethods) {
-                              cls->remove_method_definition(p.first);
+                              cls->remove_method(p.first);
+                              DexMethod::erase_method(p.first);
+                              DexMethod::delete_method(p.first);
                             }
                           });
 
   // Forward chains.
-  using iterator = std::unordered_map<DexMethodRef*, DexMethodRef*>::iterator;
-  std::function<DexMethodRef*(iterator&)> forward;
-  forward = [&forward, &removed_vmethods](iterator& it) {
-    auto it2 = removed_vmethods.find(it->second);
-    if (it2 != removed_vmethods.end()) {
-      it->second = forward(it2);
-    }
-    return it->second;
-  };
-  for (auto it = removed_vmethods.begin(); it != removed_vmethods.end(); it++) {
-    forward(it);
-  }
-
-  walk::parallel::code(scope, [&](DexMethod*, IRCode& code) {
-    editable_cfg_adapter::iterate(&code, [&](MethodItemEntry& mie) {
-      auto insn = mie.insn;
-      if (insn->opcode() == OPCODE_INVOKE_VIRTUAL) {
-        auto it = removed_vmethods.find(insn->get_method());
-        if (it != removed_vmethods.end()) {
-          insn->set_method(it->second);
-        }
-      }
-      always_assert(!insn->has_method() ||
-                    !removed_vmethods.count(insn->get_method()));
-      return editable_cfg_adapter::LOOP_CONTINUE;
-    });
-  });
+  method_dedup::fixup_references_to_removed_methods(scope, removed_vmethods);
 
   stats.report(mgr);
 }

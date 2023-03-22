@@ -13,7 +13,7 @@
 #include <unordered_set>
 #include <vector>
 
-#include "IRCode.h"
+#include "ControlFlow.h"
 #include "Liveness.h"
 #include "RegisterType.h"
 
@@ -203,15 +203,6 @@ class Graph {
            m_containment_graph.end();
   }
 
-  /*
-   * Returns the live-out info for a given instruction that has a potential
-   * range encoding. We can use it to make better allocation decisions for
-   * these instructions.
-   */
-  const LivenessDomain& get_liveness(const IRInstruction* insn) const {
-    return m_range_liveness.at(const_cast<IRInstruction*>(insn));
-  }
-
   void remove_node(reg_t);
 
   /*
@@ -240,9 +231,6 @@ class Graph {
   std::unordered_map<reg_t, Node> m_nodes;
   std::unordered_map<reg_pair_t, bool> m_adj_matrix;
   std::unordered_set<reg_pair_t> m_containment_graph;
-  // This map contains the LivenessDomains for all instructions which could
-  // potentialy take on the /range format.
-  std::unordered_map<IRInstruction*, LivenessDomain> m_range_liveness;
 
   friend class impl::GraphBuilder;
 };
@@ -252,7 +240,7 @@ class Graph {
  * the given IROpcode when it is converted to a DexInstruction in the
  * instruction lowering process.
  */
-size_t dest_bit_width(const IRList::iterator& it);
+size_t dest_bit_width(const cfg::InstructionIterator& it);
 
 /*
  * The largest valid register that we can map the symreg in insn->src(src_index)
@@ -272,15 +260,16 @@ inline uint32_t div_ceil(uint32_t a, uint32_t b) { return (a + b - 1) / b; }
  * limited public interface.
  */
 class GraphBuilder {
-  static void update_node_constraints(const IRList::iterator&,
+  static void update_node_constraints(const cfg::InstructionIterator&,
                                       const RangeSet&,
                                       Graph*);
 
  public:
   static Graph build(const LivenessFixpointIterator&,
-                     IRCode*,
+                     cfg::ControlFlowGraph&,
                      reg_t initial_regs,
-                     const RangeSet&);
+                     const RangeSet&,
+                     bool containment_edges = true);
 
   // For unit tests
   static Graph create_empty() { return Graph(); }
@@ -293,11 +282,12 @@ uint32_t edge_weight_helper(uint8_t, uint8_t);
 } // namespace impl
 
 inline Graph build_graph(const LivenessFixpointIterator& fixpoint_iter,
-                         IRCode* code,
+                         cfg::ControlFlowGraph& cfg,
                          reg_t initial_regs,
-                         const RangeSet& range_set) {
+                         const RangeSet& range_set,
+                         bool containment_edges = true) {
   return impl::GraphBuilder::build(
-      fixpoint_iter, code, initial_regs, range_set);
+      fixpoint_iter, cfg, initial_regs, range_set, containment_edges);
 }
 
 } // namespace interference

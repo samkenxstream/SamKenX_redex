@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <functional>
+#include <iterator>
 #include <type_traits>
 #include <unordered_map>
 #include <vector>
@@ -145,15 +146,15 @@ class MonotonicFixpointIteratorBase
   /*
    * Returns the invariant computed by the fixpoint iterator at a node entry.
    */
-  Domain get_entry_state_at(const NodeId& node) const {
+  const Domain& get_entry_state_at(const NodeId& node) const {
     auto it = m_entry_states.find(node);
-    return (it == m_entry_states.end()) ? Domain::bottom() : it->second;
+    return (it == m_entry_states.end()) ? m_bottom_state : it->second;
   }
 
   /*
    * Returns the invariant computed by the fixpoint iterator at a node exit.
    */
-  Domain get_exit_state_at(const NodeId& node) const {
+  const Domain& get_exit_state_at(const NodeId& node) const {
     auto it = m_exit_states.find(node);
     // It's impossible to get rid of this condition by initializing all exit
     // states to _|_ prior to starting the fixpoint iteration. The reason is
@@ -169,20 +170,12 @@ class MonotonicFixpointIteratorBase
     // When computing the entry state of A, we perform the join of the exit
     // states of all its predecessors, which include U. Since U is invisible to
     // the fixpoint iterator, there is no way to initialize its exit state.
-    return (it == m_exit_states.end()) ? Domain::bottom() : it->second;
+    return (it == m_exit_states.end()) ? m_bottom_state : it->second;
   }
 
   void clear() {
     m_entry_states.clear();
     m_exit_states.clear();
-  }
-
-  void set_all_to_bottom(std::unordered_set<NodeId>& all_nodes) {
-    // Pre-populate entry and exit states for all nodes.
-    for (auto& node : all_nodes) {
-      m_entry_states[node] = Domain::bottom();
-      m_exit_states[node] = Domain::bottom();
-    }
   }
 
   void compute_entry_state(Context* context,
@@ -216,8 +209,47 @@ class MonotonicFixpointIteratorBase
   }
 
   const Graph& m_graph;
+  const Domain m_bottom_state = Domain::bottom();
   std::unordered_map<NodeId, Domain, NodeHash> m_entry_states;
   std::unordered_map<NodeId, Domain, NodeHash> m_exit_states;
+};
+
+template <typename GraphInterface, typename NodeHash>
+class SuccessorNodeListBuilder {
+  using Graph = typename GraphInterface::Graph;
+  using NodeId = typename GraphInterface::NodeId;
+
+ public:
+  SuccessorNodeListBuilder(const Graph& graph) : m_graph(graph) {}
+
+  std::vector<NodeId> operator()(const NodeId& x) {
+    const auto& succ_edges = GraphInterface::successors(m_graph, x);
+
+    std::vector<NodeId> succ_nodes;
+    std::transform(succ_edges.begin(),
+                   succ_edges.end(),
+                   std::inserter(succ_nodes, succ_nodes.end()),
+                   std::bind(&GraphInterface::target,
+                             std::ref(m_graph),
+                             std::placeholders::_1));
+
+    // Deduplicate elements
+    std::unordered_set<NodeId, NodeHash> succ_nodes_dedup_set{
+        succ_nodes.begin(), succ_nodes.end()};
+
+    std::vector<NodeId> ret;
+    std::copy_if(std::make_move_iterator(succ_nodes.begin()),
+                 std::make_move_iterator(succ_nodes.end()),
+                 std::back_inserter(ret),
+                 [&succ_nodes_dedup_set](const NodeId& id) {
+                   return succ_nodes_dedup_set.find(id) !=
+                          succ_nodes_dedup_set.end();
+                 });
+    return ret;
+  }
+
+ private:
+  const Graph& m_graph;
 };
 
 } // namespace fp_impl
@@ -351,26 +383,7 @@ class ParallelMonotonicFixpointIterator
                 graph, /*cfg_size_hint*/ 4),
         m_wpo(
             GraphInterface::entry(graph),
-            [=, &graph](const NodeId& x) {
-              const auto& succ_edges = GraphInterface::successors(graph, x);
-              std::vector<NodeId> succ_nodes_tmp;
-              std::transform(succ_edges.begin(),
-                             succ_edges.end(),
-                             std::back_inserter(succ_nodes_tmp),
-                             std::bind(&GraphInterface::target,
-                                       std::ref(graph),
-                                       std::placeholders::_1));
-              // Filter out duplicate succ nodes.
-              std::vector<NodeId> succ_nodes;
-              std::unordered_set<NodeId> succ_nodes_set;
-              for (auto node : succ_nodes_tmp) {
-                if (!succ_nodes_set.count(node)) {
-                  succ_nodes_set.emplace(node);
-                  succ_nodes.emplace_back(node);
-                }
-              }
-              return succ_nodes;
-            },
+            fp_impl::SuccessorNodeListBuilder<GraphInterface, NodeHash>(graph),
             false),
         m_num_thread(num_thread) {
     // Gathering all reachable nodes in graph.
@@ -382,11 +395,55 @@ class ParallelMonotonicFixpointIterator
       node_queue.pop();
       for (auto& edge : GraphInterface::successors(graph, node)) {
         auto target = GraphInterface::target(graph, edge);
-        if (!m_all_nodes.count(target)) {
-          m_all_nodes.emplace(target);
+        if (m_all_nodes.emplace(target).second) {
           node_queue.push(target);
         }
       }
+    }
+  }
+
+  void set_all_to_bottom() {
+    if (this->m_entry_states.size() < ChunkSize) {
+      this->m_entry_states.reserve(m_all_nodes.size());
+      this->m_exit_states.reserve(m_all_nodes.size());
+      // Pre-populate entry and exit states for all nodes.
+      for (auto& node : m_all_nodes) {
+        this->m_entry_states[node] = Domain::bottom();
+        this->m_exit_states[node] = Domain::bottom();
+      }
+      return;
+    }
+
+    assert(this->m_entry_states.size() == m_all_nodes.size());
+    assert(this->m_exit_states.size() == m_all_nodes.size());
+    // We are going to destroy a lot of domain values, which can be relatively
+    // expensive. To speed this up, we are going to process chunks in
+    // parallel.
+    std::vector<Domain*> linear_map;
+    linear_map.reserve(m_all_nodes.size() * 2);
+    for (auto& [node, state] : this->m_entry_states) {
+      linear_map.push_back(&state);
+    }
+    for (auto& [node, state] : this->m_exit_states) {
+      linear_map.push_back(&state);
+    }
+    auto wq = sparta::work_queue<size_t>(
+        [&linear_map](SpartaWorkerState<size_t>* worker_state, size_t start) {
+          size_t end = std::min(linear_map.size(), start + ChunkSize);
+          for (size_t i = start; i < end; i++) {
+            *linear_map[i] = Domain::bottom();
+          }
+        });
+    for (size_t i = 0; i < linear_map.size(); i += ChunkSize) {
+      wq.add_item(i);
+    }
+    wq.run_all();
+  }
+
+  virtual ~ParallelMonotonicFixpointIterator() {
+    if (this->m_entry_states.size() >= ChunkSize) {
+      // We clear the memory explicitly so that we can do it faster in parallel.
+      this->set_all_to_bottom();
     }
   }
 
@@ -397,7 +454,7 @@ class ParallelMonotonicFixpointIterator
    * initial conditions.
    */
   void run(const Domain& init) {
-    this->set_all_to_bottom(m_all_nodes);
+    this->set_all_to_bottom();
     Context context(init, m_all_nodes);
     std::unique_ptr<std::atomic<uint32_t>[]> wpo_counter(
         new std::atomic<uint32_t>[m_wpo.size()]);
@@ -494,6 +551,7 @@ class ParallelMonotonicFixpointIterator
   WeakPartialOrdering<NodeId, NodeHash> m_wpo;
   size_t m_num_thread;
   std::unordered_set<NodeId> m_all_nodes;
+  static constexpr size_t ChunkSize = 512;
 };
 
 /*
@@ -520,26 +578,7 @@ class MonotonicFixpointIterator
                                                NodeHash>(graph, cfg_size_hint),
         m_wpo(
             GraphInterface::entry(graph),
-            [=, &graph](const NodeId& x) {
-              const auto& succ_edges = GraphInterface::successors(graph, x);
-              std::vector<NodeId> succ_nodes_tmp;
-              std::transform(succ_edges.begin(),
-                             succ_edges.end(),
-                             std::back_inserter(succ_nodes_tmp),
-                             std::bind(&GraphInterface::target,
-                                       std::ref(graph),
-                                       std::placeholders::_1));
-              // Filter out duplicate succ nodes.
-              std::vector<NodeId> succ_nodes;
-              std::unordered_set<NodeId, NodeHash> succ_nodes_set;
-              for (auto node : succ_nodes_tmp) {
-                if (!succ_nodes_set.count(node)) {
-                  succ_nodes_set.emplace(node);
-                  succ_nodes.emplace_back(node);
-                }
-              }
-              return succ_nodes;
-            },
+            fp_impl::SuccessorNodeListBuilder<GraphInterface, NodeHash>(graph),
             false) {}
 
   /*
@@ -660,12 +699,14 @@ class BackwardsFixpointIterationAdaptor {
   static NodeId exit(const Graph& graph) {
     return GraphInterface::entry(graph);
   }
-  static std::vector<EdgeId> predecessors(const Graph& graph,
-                                          const NodeId& node) {
+  static decltype(GraphInterface::successors(std::declval<const Graph&>(),
+                                             std::declval<const NodeId&>()))
+  predecessors(const Graph& graph, const NodeId& node) {
     return GraphInterface::successors(graph, node);
   }
-  static std::vector<EdgeId> successors(const Graph& graph,
-                                        const NodeId& node) {
+  static decltype(GraphInterface::predecessors(std::declval<const Graph&>(),
+                                               std::declval<const NodeId&>()))
+  successors(const Graph& graph, const NodeId& node) {
     return GraphInterface::predecessors(graph, node);
   }
   static NodeId source(const Graph& graph, const EdgeId& edge) {

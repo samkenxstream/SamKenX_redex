@@ -9,8 +9,6 @@
 
 #include "BaseIRAnalyzer.h"
 #include "ConstantAbstractDomain.h"
-#include "ControlFlow.h"
-#include "IRCode.h"
 #include "Liveness.h"
 #include "PatriciaTreeMapAbstractEnvironment.h"
 #include "Resolver.h"
@@ -219,13 +217,14 @@ void BuilderAnalysis::run_analysis() {
     return;
   }
 
-  code->build_cfg(/* editable */ false);
+  always_assert(code->editable_cfg_built());
   cfg::ControlFlowGraph& cfg = code->cfg();
   cfg.calculate_exit_block();
   m_analyzer.reset(new impl::Analyzer(
       cfg, m_builder_types, m_excluded_builder_types, m_accept_excluded));
 
   populate_usage();
+  cfg.recompute_registers_size();
   update_stats();
 }
 
@@ -243,8 +242,8 @@ void BuilderAnalysis::print_usage() {
   for (const auto& pair : m_usage) {
     TRACE(BLD_PATTERN, 4, "\nInitialization in %s", SHOW(pair.first));
 
-    for (const auto& insn : pair.second) {
-      TRACE(BLD_PATTERN, 4, "\t Usage: %s", SHOW(insn));
+    for (const auto& it : pair.second) {
+      TRACE(BLD_PATTERN, 4, "\t Usage: %s", SHOW(it->insn));
     }
   }
 }
@@ -300,10 +299,16 @@ void BuilderAnalysis::populate_usage() {
 
   // If the instantiated type is not excluded, updates the usages map.
   // Otherwise, update the excluded instantiation list.
-  auto update_usages = [&](const IRInstruction* val, IRInstruction* insn) {
+  auto update_usages = [&](const IRInstruction* val,
+                           const cfg::InstructionIterator& use) {
     if (auto referenced_type = get_instantiated_type(val)) {
       if (m_excluded_builder_types.count(referenced_type) == 0) {
-        m_usage[val].push_back(insn);
+        m_usage[val].push_back(use);
+
+        auto insn = use->insn;
+        if (opcode::is_an_invoke(insn->opcode())) {
+          m_invoke_to_builder_instance[insn] = referenced_type;
+        }
       }
 
       m_excluded_instantiation.emplace(val);
@@ -313,6 +318,7 @@ void BuilderAnalysis::populate_usage() {
   for (cfg::Block* block : cfg.blocks()) {
     auto env = m_analyzer->get_entry_state_at(block);
     for (auto& mie : InstructionIterable(block)) {
+      auto it = block->to_cfg_instruction_iterator(mie);
       IRInstruction* insn = mie.insn;
       m_insn_to_env->emplace(insn, env);
       m_analyzer->analyze_instruction(insn, &env);
@@ -321,7 +327,7 @@ void BuilderAnalysis::populate_usage() {
         auto dest = insn->dest();
         auto val_dest = env.get(dest).get_constant();
         if (val_dest) {
-          update_usages(*val_dest, insn);
+          update_usages(*val_dest, it);
         }
       }
 
@@ -329,7 +335,7 @@ void BuilderAnalysis::populate_usage() {
         auto src = insn->src(index);
         auto val_src = env.get(src).get_constant();
         if (val_src) {
-          update_usages(*val_src, insn);
+          update_usages(*val_src, it);
         }
       }
     }
@@ -348,7 +354,8 @@ BuilderAnalysis::get_vinvokes_to_this_infered_type() {
       result[const_cast<IRInstruction*>(pair.first)] = current_instance;
     }
 
-    for (auto& insn : pair.second) {
+    for (auto& it : pair.second) {
+      auto* insn = it->insn;
       if (opcode::is_invoke_virtual(insn->opcode())) {
         auto this_reg = insn->src(0);
         auto val = m_insn_to_env->at(insn).get(this_reg).get_constant();
@@ -375,7 +382,8 @@ std::unordered_set<IRInstruction*> BuilderAnalysis::get_all_inlinable_insns() {
       result.emplace(const_cast<IRInstruction*>(pair.first));
     }
 
-    for (auto& insn : pair.second) {
+    for (const auto& it : pair.second) {
+      auto* insn = it->insn;
       if (opcode::is_an_invoke(insn->opcode())) {
         result.emplace(const_cast<IRInstruction*>(insn));
       }
@@ -408,28 +416,24 @@ std::unordered_set<IRInstruction*> BuilderAnalysis::get_all_inlinable_insns() {
   return result;
 }
 
-ConstTypeHashSet BuilderAnalysis::get_instantiated_types(
-    std::unordered_set<const IRInstruction*>* insns) {
+ConstTypeHashSet BuilderAnalysis::get_escaped_types_from_invokes(
+    const std::unordered_set<IRInstruction*>& invoke_insns) const {
   ConstTypeHashSet result;
-  bool check_specific_insn = insns != nullptr;
+
+  for (const auto* invoke : invoke_insns) {
+    if (m_invoke_to_builder_instance.count(invoke)) {
+      result.emplace(m_invoke_to_builder_instance.at(invoke));
+    }
+  }
+  return result;
+}
+
+ConstTypeHashSet BuilderAnalysis::get_instantiated_types() {
+  ConstTypeHashSet result;
 
   for (const auto& pair : m_usage) {
     auto type = get_instantiated_type(pair.first);
-
-    if (!check_specific_insn) {
-      result.emplace(type);
-      continue;
-    } else if (insns->count(const_cast<IRInstruction*>(pair.first))) {
-      result.emplace(type);
-      continue;
-    }
-
-    for (const auto& insn : pair.second) {
-      if (insns->count(const_cast<IRInstruction*>(insn))) {
-        result.emplace(type);
-        break;
-      }
-    }
+    result.emplace(type);
   }
 
   return result;
@@ -455,15 +459,27 @@ ConstTypeHashSet BuilderAnalysis::non_removable_types() {
 
   // Consider other non-removable usages (for example synchronization usage).
   for (const auto& pair : m_usage) {
-    auto current_instance = get_instantiated_type(pair.first);
+    auto instantiation = pair.first;
+    auto current_instance = get_instantiated_type(instantiation);
 
     if (non_removable_types.count(current_instance)) {
       // Already decided it isn't removable.
       continue;
     }
 
-    for (const IRInstruction* insn : pair.second) {
-      if (opcode::is_a_monitor(insn->opcode())) {
+    // Check if the instantiation is an invoke and non-inlinable.
+    if (opcode::is_an_invoke(instantiation->opcode())) {
+      auto method = resolve_method(instantiation->get_method(),
+                                   opcode_to_search(instantiation));
+      if (!method || !method->get_code()) {
+        non_removable_types.emplace(current_instance);
+        TRACE(BLD_PATTERN, 3, "non removal instantiation %s",
+              SHOW(instantiation));
+      }
+    }
+
+    for (const auto& it : pair.second) {
+      if (opcode::is_a_monitor(it->insn->opcode())) {
         non_removable_types.emplace(current_instance);
         break;
       }
@@ -485,7 +501,8 @@ ConstTypeHashSet BuilderAnalysis::escape_types() {
     auto instantiation_insn = pair.first;
     auto current_instance = get_instantiated_type(instantiation_insn);
 
-    for (const auto& insn : pair.second) {
+    for (const auto& it : pair.second) {
+      auto* insn = it->insn;
       // If there is any invoke here, it is because we couldn't inline it.
       if (opcode::is_an_invoke(insn->opcode())) {
         // We accept Object.<init> calls.
@@ -523,12 +540,13 @@ ConstTypeHashSet BuilderAnalysis::escape_types() {
   liveness_iter.run(LivenessDomain());
 
   for (cfg::Block* block : cfg.blocks()) {
-    auto current_env = m_analyzer->get_exit_state_at(block);
+    const auto& current_env = m_analyzer->get_exit_state_at(block);
 
     for (auto& succ : block->succs()) {
       cfg::Block* block_succ = succ->target();
-      auto entry_env_at_succ = m_analyzer->get_entry_state_at(block_succ);
-      auto live_in_vars_at_succ =
+      const auto& entry_env_at_succ =
+          m_analyzer->get_entry_state_at(block_succ);
+      const auto& live_in_vars_at_succ =
           liveness_iter.get_live_in_vars_at(succ->target());
 
       // Check that live registers, if they hold a builder at the end of block

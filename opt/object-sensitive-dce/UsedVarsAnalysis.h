@@ -81,11 +81,11 @@ class FixpointIterator final
   bool is_required(const IRInstruction* insn,
                    const UsedVarsSet& used_vars) const;
 
-  UsedVarsSet get_used_vars_at_entry(const NodeId& block) const {
+  const UsedVarsSet& get_used_vars_at_entry(const NodeId& block) const {
     return get_exit_state_at(block);
   }
 
-  UsedVarsSet get_used_vars_at_exit(const NodeId& block) const {
+  const UsedVarsSet& get_used_vars_at_exit(const NodeId& block) const {
     return get_entry_state_at(block);
   }
 
@@ -95,7 +95,11 @@ class FixpointIterator final
   side_effects::InvokeToSummaryMap m_invoke_to_summary_map;
 };
 
+// Deprecated, will be removed.
 std::vector<IRList::iterator> get_dead_instructions(const IRCode&,
                                                     const FixpointIterator&);
+
+std::vector<cfg::InstructionIterator> get_dead_instructions(
+    const cfg::ControlFlowGraph&, const FixpointIterator&);
 
 } // namespace used_vars

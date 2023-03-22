@@ -7,6 +7,7 @@
 
 #include "SpartaWorkQueue.h"
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <gtest/gtest.h>
@@ -98,4 +99,30 @@ TEST(SpartaWorkQueueTest, preciseScheduling) {
   for (int idx = 0; idx < NUM_INTS; ++idx) {
     ASSERT_EQ(1, array[idx]);
   }
+}
+
+TEST(SpartaWorkQueueTest, exceptionPropagation) {
+  auto wq = sparta::work_queue<int>([](int i) {
+    if (i == 666) {
+      throw std::logic_error("exception!");
+    }
+  });
+
+  for (int idx = 0; idx < NUM_INTS; ++idx) {
+    wq.add_item(idx);
+  }
+  ASSERT_THROW(wq.run_all(), std::logic_error);
+}
+
+TEST(SpartaWorkQueueTest, multipleExceptions) {
+  auto wq = sparta::work_queue<int>([](int i) {
+    if (i % 3 == 0) {
+      throw std::logic_error("exception!");
+    }
+  });
+
+  for (int idx = 0; idx < NUM_INTS; ++idx) {
+    wq.add_item(idx);
+  }
+  ASSERT_THROW(wq.run_all(), std::logic_error);
 }

@@ -8,7 +8,6 @@
 #pragma once
 
 #include "BigBlocks.h"
-#include "Dominators.h"
 #include "Lazy.h"
 #include "OutliningProfileGuidance.h"
 
@@ -47,6 +46,13 @@ void gather_sufficiently_warm_and_hot_methods(
     std::unordered_set<DexMethod*>* sufficiently_warm_methods,
     std::unordered_set<DexMethod*>* sufficiently_hot_methods);
 
+void propagate_hotness(
+    const Scope& scope,
+    ConfigFiles& config_files,
+    std::unordered_set<DexMethod*>* sufficiently_warm_methods,
+    std::unordered_set<DexMethod*>* sufficiently_hot_methods,
+    float block_profiles_hits);
+
 outliner::PerfSensitivity parse_perf_sensitivity(const std::string& str);
 
 class CanOutlineBlockDecider {
@@ -57,8 +63,6 @@ class CanOutlineBlockDecider {
   mutable std::unique_ptr<LazyUnorderedMap<cfg::Block*, bool>> m_is_in_loop;
   mutable std::unique_ptr<LazyUnorderedMap<cfg::Block*, boost::optional<float>>>
       m_max_vals;
-  mutable std::unique_ptr<dominators::SimpleFastDominators<cfg::GraphInterface>>
-      m_dominators;
 
  public:
   CanOutlineBlockDecider(const outliner::ProfileGuidanceConfig& config,

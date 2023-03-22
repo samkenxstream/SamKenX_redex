@@ -54,6 +54,18 @@ enum TypeTagConfig {
   INPUT_HANDLED = 3,
 };
 
+enum TypeLikeStringConfig {
+  // Type like strings are safe to be replaced with the name of the new
+  // shape class. The assumption is that the reflections against the type like
+  // strings still work after merging. This usually means type tags exist in the
+  // targeted input. Merging only changes class names not intiantiation pattern.
+  REPLACE = 0,
+  // Do not merge classes potentially reflected using the type like string. It's
+  // more conservative. We do not have the full knowledge about the reflection
+  // pattern. It's better to avoid merging altogether.
+  EXCLUDE = 1,
+};
+
 /**
  * A class hierarchy specification to model for erasure.
  * This is normally specified via config entries:
@@ -135,7 +147,7 @@ struct ModelSpec {
   strategy::Strategy strategy{strategy::BY_CLASS_COUNT};
   // Group splitting. This is looser than the per dex split and takes into
   // account the interdex order (if any provided).
-  InterDexGroupingType merge_per_interdex_set{InterDexGroupingType::DISABLED};
+  InterDexGroupingType interdex_grouping{InterDexGroupingType::DISABLED};
   // whether to perform class merging on the primary dex.
   bool include_primary_dex{false};
   // Process @MethodMeta annotations
@@ -149,14 +161,12 @@ struct ModelSpec {
   bool merge_types_with_static_fields{false};
   // Preserve debug info like line numbers.
   bool keep_debug_info{false};
-  // A flag for method deduplication. Deduplicating throw blocks for
-  // human-written code may make java stack trace confusing.
-  bool dedup_throw_blocks{true};
-  // Replace string literals matching a merged type.
-  bool replace_type_like_const_strings{true};
-  // Whether string literals matching class names disqualifies classes from
-  // being merged
-  bool type_like_const_strings_unsafe{false};
+  // A flag for method deduplication. Deduplicating block that explicitly
+  // capture stack traces for human-written code may make java stack trace
+  // confusing.
+  bool dedup_fill_in_stack_trace{true};
+  // Replace type like string or exclude potentially referenced class.
+  TypeLikeStringConfig type_like_string_confg{TypeLikeStringConfig::EXCLUDE};
   // Indicates if the merging should be performed per dex.
   bool per_dex_grouping{false};
   // The Model targets are generated code. If so, we consider merging_targets as
@@ -187,6 +197,14 @@ struct ModelSpec {
   bool pass_type_tag_to_ctor() const {
     return type_tag_config == TypeTagConfig::GENERATE ||
            type_tag_config == TypeTagConfig::INPUT_PASS_TYPE_TAG_TO_CTOR;
+  }
+
+  bool replace_type_like_strings() const {
+    return type_like_string_confg == TypeLikeStringConfig::REPLACE;
+  }
+
+  bool exclude_type_like_strings() const {
+    return type_like_string_confg == TypeLikeStringConfig::EXCLUDE;
   }
 
   boost::optional<size_t> max_num_dispatch_target{boost::none};
@@ -273,8 +291,8 @@ class Model {
     return m_spec.class_name_prefix;
   }
 
-  bool is_merge_per_interdex_set_enabled() const {
-    return m_spec.merge_per_interdex_set != InterDexGroupingType::DISABLED;
+  bool is_interdex_grouping_enabled() const {
+    return m_spec.interdex_grouping != InterDexGroupingType::DISABLED;
   }
 
   const ModelSpec& get_model_spec() const { return m_spec; }
@@ -371,7 +389,6 @@ class Model {
   static std::unordered_map<DexType*, size_t> s_cls_to_interdex_group;
   static size_t s_num_interdex_groups;
 
- private:
   /**
    * Build a Model given a set of roots and a set of types deriving from the
    * roots.
@@ -463,7 +480,7 @@ class Model {
 
   void move_child_to_mergeables(MergerType& merger, const DexType* child) {
     TRACE(CLMG, 3, "Adding child %s to merger %s", show_type(child).c_str(),
-          print(&merger).c_str());
+          print(merger).c_str());
     remove_child(child);
     merger.mergeables.insert(child);
   }
@@ -472,7 +489,7 @@ class Model {
                                                      // header.
 
   // printers
-  std::string print(const MergerType* merger) const;
+  std::string print(const MergerType& merger) const;
   std::string print(const DexType* type) const;
   std::string print(const DexType* type, int nest) const;
 
@@ -481,15 +498,21 @@ class Model {
   void walk_hierarchy_helper(HierarchyWalkerFn walker, const DexType* type) {
     const auto& children = m_hierarchy.find(type);
     if (children == m_hierarchy.end()) return;
-    for (const auto& child : children->second) {
-      const auto& merger = m_mergers.find(child);
-      if (merger != m_mergers.end() && !merger->second.dummy) {
-        walker(merger->second);
+    for (const auto* child : children->second) {
+      const auto& merger_it = m_mergers.find(child);
+      if (merger_it != m_mergers.end()) {
+        const auto& merger = merger_it->second;
+        if (!merger.dummy) {
+          walker(merger);
+        }
       }
       walk_hierarchy_helper(walker, child);
     }
   }
 };
+
+InterDexGroupingType get_merge_per_interdex_type(
+    const std::string& interdex_grouping);
 
 std::ostream& operator<<(std::ostream& os,
                          ModelSpec::InterDexGroupingInferringMode mode);

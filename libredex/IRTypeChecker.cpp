@@ -46,11 +46,11 @@ std::ostringstream& print_register(std::ostringstream& out, reg_t reg) {
 }
 
 void check_type_match(reg_t reg, IRType actual, IRType expected) {
-  if (actual == BOTTOM) {
+  if (actual == IRType::BOTTOM) {
     // There's nothing to do for unreachable code.
     return;
   }
-  if (actual == SCALAR && expected != REFERENCE) {
+  if (actual == IRType::SCALAR && expected != IRType::REFERENCE) {
     // If the type is SCALAR and we're checking compatibility with an integer
     // or float type, we just bail out.
     return;
@@ -157,12 +157,12 @@ void check_wide_type_match(reg_t reg,
                            IRType actual2,
                            IRType expected1,
                            IRType expected2) {
-  if (actual1 == BOTTOM) {
+  if (actual1 == IRType::BOTTOM) {
     // There's nothing to do for unreachable code.
     return;
   }
 
-  if (actual1 == SCALAR1 && actual2 == SCALAR2) {
+  if (actual1 == IRType::SCALAR1 && actual2 == IRType::SCALAR2) {
     // If type of the pair of registers is (SCALAR1, SCALAR2), we just bail
     // out.
     return;
@@ -186,7 +186,7 @@ void assume_type(TypeEnvironment* state,
     return;
   }
   IRType actual = state->get_type(reg).element();
-  if (ignore_top && actual == TOP) {
+  if (ignore_top && actual == IRType::TOP) {
     return;
   }
   check_type_match(reg, actual, /* expected */ expected);
@@ -218,13 +218,13 @@ void assume_comparable_with_zero(TypeEnvironment* state, reg_t reg) {
     return;
   }
   IRType t = state->get_type(reg).element();
-  if (t == SCALAR) {
+  if (t == IRType::SCALAR) {
     // We can't say anything conclusive about a register that has SCALAR type,
     // so we just bail out.
     return;
   }
-  if (!(TypeDomain(t).leq(TypeDomain(REFERENCE)) ||
-        TypeDomain(t).leq(TypeDomain(INT)))) {
+  if (!(TypeDomain(t).leq(TypeDomain(IRType::REFERENCE)) ||
+        TypeDomain(t).leq(TypeDomain(IRType::INT)))) {
     std::ostringstream out;
     print_register(out, reg)
         << ": expected integer or reference type, but found " << t
@@ -243,11 +243,11 @@ void assume_comparable(TypeEnvironment* state, reg_t reg1, reg_t reg2) {
   }
   IRType t1 = state->get_type(reg1).element();
   IRType t2 = state->get_type(reg2).element();
-  if (!((TypeDomain(t1).leq(TypeDomain(REFERENCE)) &&
-         TypeDomain(t2).leq(TypeDomain(REFERENCE))) ||
-        (TypeDomain(t1).leq(TypeDomain(SCALAR)) &&
-         TypeDomain(t2).leq(TypeDomain(SCALAR)) && (t1 != FLOAT) &&
-         (t2 != FLOAT)))) {
+  if (!((TypeDomain(t1).leq(TypeDomain(IRType::REFERENCE)) &&
+         TypeDomain(t2).leq(TypeDomain(IRType::REFERENCE))) ||
+        (TypeDomain(t1).leq(TypeDomain(IRType::SCALAR)) &&
+         TypeDomain(t2).leq(TypeDomain(IRType::SCALAR)) &&
+         (t1 != IRType::FLOAT) && (t2 != IRType::FLOAT)))) {
     // Two values can be used in a comparison operation if they either both
     // have the REFERENCE type or have non-float scalar types. Note that in
     // the case where one or both types have the SCALAR type, we can't
@@ -261,25 +261,30 @@ void assume_comparable(TypeEnvironment* state, reg_t reg1, reg_t reg2) {
 }
 
 void assume_integer(TypeEnvironment* state, reg_t reg) {
-  assume_type(state, reg, /* expected */ INT);
+  assume_type(state, reg, /* expected */ IRType::INT);
 }
 
 void assume_float(TypeEnvironment* state, reg_t reg) {
-  assume_type(state, reg, /* expected */ FLOAT);
+  assume_type(state, reg, /* expected */ IRType::FLOAT);
 }
 
 void assume_long(TypeEnvironment* state, reg_t reg) {
-  assume_wide_type(state, reg, /* expected1 */ LONG1, /* expected2 */ LONG2);
+  assume_wide_type(
+      state, reg, /* expected1 */ IRType::LONG1, /* expected2 */ IRType::LONG2);
 }
 
 void assume_double(TypeEnvironment* state, reg_t reg) {
-  assume_wide_type(
-      state, reg, /* expected1 */ DOUBLE1, /* expected2 */ DOUBLE2);
+  assume_wide_type(state,
+                   reg,
+                   /* expected1 */ IRType::DOUBLE1,
+                   /* expected2 */ IRType::DOUBLE2);
 }
 
 void assume_wide_scalar(TypeEnvironment* state, reg_t reg) {
-  assume_wide_type(
-      state, reg, /* expected1 */ SCALAR1, /* expected2 */ SCALAR2);
+  assume_wide_type(state,
+                   reg,
+                   /* expected1 */ IRType::SCALAR1,
+                   /* expected2 */ IRType::SCALAR2);
 }
 
 class Result final {
@@ -683,33 +688,11 @@ Result check_monitors(const DexMethod* method) {
 
 /**
  * Validate if the caller has the permit to call a method or access a field.
- *
- * +-------------------------+--------+----------+-----------+-------+
- * | Access Levels Modifier  | Class  | Package  | Subclass  | World |
- * +-------------------------+--------+----------+-----------+-------+
- * | public                  | Y      | Y        | Y         | Y     |
- * | protected               | Y      | Y        | Y         | N     |
- * | no modifier             | Y      | Y        | N         | N     |
- * | private                 | Y      | N        | N         | N     |
- * +-------------------------+--------+----------+-----------+-------+
  */
 template <typename DexMember>
 void validate_access(const DexMethod* accessor, const DexMember* accessee) {
-  auto accessor_class = accessor->get_class();
-  if (accessee == nullptr || is_public(accessee) ||
-      accessor_class == accessee->get_class()) {
+  if (type::can_access(accessor, accessee)) {
     return;
-  }
-  if (!is_private(accessee)) {
-    auto accessee_class = accessee->get_class();
-    auto from_same_package = type::same_package(accessor_class, accessee_class);
-    if (is_package_private(accessee) && from_same_package) {
-      return;
-    } else if (is_protected(accessee) &&
-               (from_same_package ||
-                type::check_cast(accessor_class, accessee_class))) {
-      return;
-    }
   }
 
   std::ostringstream out;
@@ -732,10 +715,27 @@ void validate_access(const DexMethod* accessor, const DexMember* accessee) {
   throw TypeCheckingException(out.str());
 }
 
-void validate_invoke_super(const DexMethodRef* callee) {
+void validate_invoke_super(const DexMethod* caller,
+                           const DexMethodRef* callee) {
+  if (callee == nullptr) {
+    // Forgive unresolved refs.
+    return;
+  }
   auto callee_cls = type_class(callee->get_class());
   if (!callee_cls || !is_interface(callee_cls)) {
     return;
+  }
+
+  if (callee->is_def()) {
+    const DexMethod* callee_method = callee->as_def();
+    if (callee_method->is_external() && !is_abstract(callee_method)) {
+      // An external interface method might a default one. Invoking the external
+      // default method from a subclass using INVOKE_SUPER is permitted. This is
+      // independent from Dex format 037 support.
+      if (type::can_access(caller, callee_method)) {
+        return;
+      }
+    }
   }
 
   std::ostringstream out;
@@ -855,7 +855,7 @@ void IRTypeChecker::assume_scalar(TypeEnvironment* state,
                                   bool in_move) const {
   assume_type(state,
               reg,
-              /* expected */ SCALAR,
+              /* expected */ IRType::SCALAR,
               /* ignore_top */ in_move && !m_verify_moves);
 }
 
@@ -864,7 +864,7 @@ void IRTypeChecker::assume_reference(TypeEnvironment* state,
                                      bool in_move) const {
   assume_type(state,
               reg,
-              /* expected */ REFERENCE,
+              /* expected */ IRType::REFERENCE,
               /* ignore_top */ in_move && !m_verify_moves);
 }
 
@@ -975,6 +975,12 @@ void IRTypeChecker::check_instruction(IRInstruction* insn,
     break;
   }
   case OPCODE_CONST_CLASS: {
+    break;
+  }
+  case OPCODE_CONST_METHOD_HANDLE: {
+    break;
+  }
+  case OPCODE_CONST_METHOD_TYPE: {
     break;
   }
   case OPCODE_MONITOR_ENTER:
@@ -1256,7 +1262,7 @@ void IRTypeChecker::check_instruction(IRInstruction* insn,
         assume_assignable(current_state->get_dex_type(src), arg_type);
         continue;
       }
-      if (type::is_integer(arg_type)) {
+      if (type::is_integral(arg_type)) {
         assume_integer(current_state, insn->src(src_idx++));
         continue;
       }
@@ -1277,7 +1283,7 @@ void IRTypeChecker::check_instruction(IRInstruction* insn,
       ::validate_access(m_dex_method, resolved);
     }
     if (m_validate_invoke_super && insn->opcode() == OPCODE_INVOKE_SUPER) {
-      validate_invoke_super(dex_method);
+      validate_invoke_super(m_dex_method, dex_method);
     }
     break;
   }
@@ -1413,28 +1419,20 @@ void IRTypeChecker::check_instruction(IRInstruction* insn,
     assume_double(current_state, insn->src(1));
     break;
   }
-  case OPCODE_ADD_INT_LIT16:
-  case OPCODE_RSUB_INT:
-  case OPCODE_MUL_INT_LIT16:
-  case OPCODE_AND_INT_LIT16:
-  case OPCODE_OR_INT_LIT16:
-  case OPCODE_XOR_INT_LIT16:
-  case OPCODE_ADD_INT_LIT8:
-  case OPCODE_RSUB_INT_LIT8:
-  case OPCODE_MUL_INT_LIT8:
-  case OPCODE_AND_INT_LIT8:
-  case OPCODE_OR_INT_LIT8:
-  case OPCODE_XOR_INT_LIT8:
-  case OPCODE_SHL_INT_LIT8:
-  case OPCODE_SHR_INT_LIT8:
-  case OPCODE_USHR_INT_LIT8: {
+  case OPCODE_ADD_INT_LIT:
+  case OPCODE_RSUB_INT_LIT:
+  case OPCODE_MUL_INT_LIT:
+  case OPCODE_AND_INT_LIT:
+  case OPCODE_OR_INT_LIT:
+  case OPCODE_XOR_INT_LIT:
+  case OPCODE_SHL_INT_LIT:
+  case OPCODE_SHR_INT_LIT:
+  case OPCODE_USHR_INT_LIT: {
     assume_integer(current_state, insn->src(0));
     break;
   }
-  case OPCODE_DIV_INT_LIT16:
-  case OPCODE_REM_INT_LIT16:
-  case OPCODE_DIV_INT_LIT8:
-  case OPCODE_REM_INT_LIT8: {
+  case OPCODE_DIV_INT_LIT:
+  case OPCODE_REM_INT_LIT: {
     assume_integer(current_state, insn->src(0));
     break;
   }
@@ -1458,7 +1456,7 @@ IRType IRTypeChecker::get_type(IRInstruction* insn, reg_t reg) const {
   if (it == type_envs.end()) {
     // The instruction doesn't belong to this method. We treat this as
     // unreachable code and return BOTTOM.
-    return BOTTOM;
+    return IRType::BOTTOM;
   }
   return it->second.get_type(reg).element();
 }
@@ -1482,9 +1480,10 @@ std::ostream& operator<<(std::ostream& output, const IRTypeChecker& checker) {
 }
 
 void IRTypeChecker::check_completion() const {
-  always_assert_log(m_complete,
-                    "The type checker did not run on method %s.\n",
-                    m_dex_method->get_deobfuscated_name_or_empty().c_str());
+  always_assert_log(
+      m_complete,
+      "The type checker did not run on method %s.\n",
+      m_dex_method->get_deobfuscated_name_or_empty_copy().c_str());
 }
 
 std::string IRTypeChecker::dump_annotated_cfg(DexMethod* method) const {

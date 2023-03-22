@@ -30,6 +30,7 @@ COMMON_INCLUDES = \
 	-I$(top_srcdir)/opt/copy-propagation \
 	-I$(top_srcdir)/opt/cse \
 	-I$(top_srcdir)/opt/dedup_blocks \
+	-I$(top_srcdir)/opt/dedup_resources \
 	-I$(top_srcdir)/opt/dedup-strings \
 	-I$(top_srcdir)/opt/delinit \
 	-I$(top_srcdir)/opt/delsuper \
@@ -44,8 +45,10 @@ COMMON_INCLUDES = \
 	-I$(top_srcdir)/opt/merge_interface \
 	-I$(top_srcdir)/opt/methodinline \
 	-I$(top_srcdir)/opt/obfuscate \
+	-I$(top_srcdir)/opt/obfuscate_resources \
 	-I$(top_srcdir)/opt/object-sensitive-dce \
 	-I$(top_srcdir)/opt/optimize_enums \
+	-I$(top_srcdir)/opt/optimize_resources \
 	-I$(top_srcdir)/opt/original_name \
 	-I$(top_srcdir)/opt/outliner \
 	-I$(top_srcdir)/opt/partial-application \
@@ -61,7 +64,6 @@ COMMON_INCLUDES = \
 	-I$(top_srcdir)/opt/remove-apilevel-checks \
 	-I$(top_srcdir)/opt/remove-builders \
 	-I$(top_srcdir)/opt/remove_empty_classes \
-	-I$(top_srcdir)/opt/remove_gotos \
 	-I$(top_srcdir)/opt/remove-interfaces \
 	-I$(top_srcdir)/opt/remove-nullcheck-string-arg \
 	-I$(top_srcdir)/opt/remove-recursive-locks \
@@ -78,6 +80,7 @@ COMMON_INCLUDES = \
 	-I$(top_srcdir)/opt/shorten-srcstrings \
 	-I$(top_srcdir)/opt/singleimpl \
 	-I$(top_srcdir)/opt/split_huge_switches \
+	-I$(top_srcdir)/opt/split_resource_tables \
 	-I$(top_srcdir)/opt/staticrelo \
 	-I$(top_srcdir)/opt/static-sink \
 	-I$(top_srcdir)/opt/stringbuilder-outliner \
@@ -99,6 +102,7 @@ COMMON_INCLUDES = \
 	-I$(top_srcdir)/service/api-levels \
 	-I$(top_srcdir)/service/class-init \
 	-I$(top_srcdir)/service/class-merging \
+	-I$(top_srcdir)/service/class-splitting \
 	-I$(top_srcdir)/service/constant-propagation \
 	-I$(top_srcdir)/service/copy-propagation \
 	-I$(top_srcdir)/service/cross-dex-ref-minimizer \
@@ -119,6 +123,7 @@ COMMON_INCLUDES = \
 	-I$(top_srcdir)/service/reference-update \
 	-I$(top_srcdir)/service/regalloc \
 	-I$(top_srcdir)/service/regalloc-fast \
+	-I$(top_srcdir)/service/resources \
 	-I$(top_srcdir)/service/shrinker \
 	-I$(top_srcdir)/service/switch-dispatch \
 	-I$(top_srcdir)/service/switch-partitioning \

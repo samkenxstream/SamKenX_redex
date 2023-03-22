@@ -18,9 +18,7 @@
 #include "AnalysisUsage.h"
 #include "AssetManager.h"
 #include "DexHasher.h"
-#include "GlobalConfig.h"
 #include "JsonWrapper.h"
-#include "ProguardConfiguration.h"
 #include "RedexOptions.h"
 #include "Timer.h"
 
@@ -32,6 +30,10 @@ namespace Json {
 class Value;
 } // namespace Json
 
+namespace keep_rules {
+struct ProguardConfiguration;
+} // namespace keep_rules
+
 // Must match DexStore.
 using DexStoresVector = std::vector<DexStore>;
 
@@ -39,14 +41,14 @@ class PassManager {
  public:
   explicit PassManager(const std::vector<Pass*>& passes);
   explicit PassManager(const std::vector<Pass*>& passes,
-                       const Json::Value& config,
+                       const ConfigFiles& config,
                        const RedexOptions& options = RedexOptions{});
 
   PassManager(const std::vector<Pass*>& passes,
               std::unique_ptr<keep_rules::ProguardConfiguration> pg_config);
   PassManager(const std::vector<Pass*>& passes,
               std::unique_ptr<keep_rules::ProguardConfiguration> pg_config,
-              const Json::Value& config,
+              const ConfigFiles& config,
               const RedexOptions& options = RedexOptions{});
 
   ~PassManager();
@@ -75,12 +77,8 @@ class PassManager {
   // A temporary hack to return the interdex metrics. Will be removed later.
   const std::unordered_map<std::string, int64_t>& get_interdex_metrics();
 
-  keep_rules::ProguardConfiguration& get_proguard_config() {
+  const keep_rules::ProguardConfiguration& get_proguard_config() {
     return *m_pg_config;
-  }
-
-  bool no_proguard_rules() {
-    return m_pg_config->keep_rules.empty() && !m_testing_mode;
   }
 
   // Call set_testing_mode() in tests that need passes to run which
@@ -119,14 +117,12 @@ class PassManager {
 
   Pass* find_pass(const std::string& pass_name) const;
 
-  const AssessorConfig& get_assessor_config() const {
-    return m_assessor_config;
-  }
-
  private:
-  void activate_pass(const std::string& name, const Json::Value& conf);
+  void activate_pass(const std::string& name,
+                     const std::string* alias,
+                     const Json::Value& conf);
 
-  void init(const Json::Value& config);
+  void init(const ConfigFiles& config);
 
   hashing::DexHash run_hasher(const char* name, const Scope& scope);
 
@@ -141,7 +137,7 @@ class PassManager {
   std::vector<PassManager::PassInfo> m_pass_info;
   PassInfo* m_current_pass_info;
 
-  std::unique_ptr<keep_rules::ProguardConfiguration> m_pg_config;
+  std::unique_ptr<const keep_rules::ProguardConfiguration> m_pg_config;
   const RedexOptions m_redex_options;
   bool m_testing_mode{false};
   bool m_regalloc_has_run{false};
@@ -155,5 +151,9 @@ class PassManager {
   AccumulatingTimer m_hashers_timer;
   AccumulatingTimer m_check_unique_deobfuscateds_timer;
 
-  AssessorConfig m_assessor_config;
+  std::vector<std::unique_ptr<Pass>> m_cloned_passes;
+
+  // unique_ptr to avoid header include.
+  struct InternalFields;
+  std::unique_ptr<InternalFields> m_internal_fields;
 };

@@ -9,7 +9,6 @@
 import argparse
 import errno
 import glob
-import hashlib
 import json
 import logging
 import os
@@ -21,25 +20,26 @@ import sys
 import tempfile
 import timeit
 import typing
-import zipfile
 from os.path import abspath, dirname, getsize, isdir, isfile, join
 from pipes import quote
 
 import pyredex.bintools as bintools
 import pyredex.logger as logger
 from pyredex.buck import BuckConnectionScope, BuckPartScope
+from pyredex.packer import compress_entries, CompressionEntry, CompressionLevel
 from pyredex.unpacker import (
     LibraryManager,
+    unpack_tar_xz,
     UnpackManager,
     ZipManager,
     ZipReset,
-    unpack_tar_xz,
 )
 from pyredex.utils import (
     add_android_sdk_path,
+    add_tool_override,
     argparse_yes_no_flag,
     dex_glob,
-    find_android_build_tool,
+    find_zipalign,
     get_android_sdk_path,
     get_file_ext,
     make_temp_dir,
@@ -217,6 +217,24 @@ class State(object):
         self.zip_manager = zip_manager
 
 
+class RedexRunException(Exception):
+    def __init__(
+        self,
+        msg: str,
+        return_code: int,
+        abort_error: typing.Optional[str],
+        symbolized: typing.Optional[typing.List[str]],
+    ) -> None:
+        super().__init__(msg, return_code, abort_error, symbolized)
+        self.msg = msg
+        self.return_code = return_code
+        self.abort_error = abort_error
+        self.symbolized = symbolized
+
+    def __str__(self) -> str:
+        return self.msg
+
+
 def run_redex_binary(
     state: State,
     exception_formatter: ExceptionMessageFormatter,
@@ -342,15 +360,18 @@ def run_redex_binary(
                 return
 
             # Check for crash traces.
-            bintools.maybe_addr2line(err_out)
+            symbolized = bintools.maybe_addr2line(err_out)
+            if symbolized:
+                sys.stderr.write("\n")
+                sys.stderr.write("\n".join(symbolized))
+                sys.stderr.write("\n")
 
             abort_error = None
             if returncode == -6:  # SIGABRT
                 abort_error = bintools.find_abort_error(err_out)
-            abort_error = "\n" + abort_error if abort_error else ""
 
             default_error_msg = "redex-all crashed with exit code {}!{}".format(
-                returncode, abort_error
+                returncode, "\n" + abort_error if abort_error else ""
             )
             if IS_WINDOWS:
                 raise RuntimeError(default_error_msg)
@@ -362,9 +383,12 @@ def run_redex_binary(
                 "lldb", state.args.debug_source_root, args
             )
             msg = exception_formatter.format_message(
-                err_out, default_error_msg, gdb_script_name, lldb_script_name
+                err_out,
+                default_error_msg,
+                gdb_script_name,
+                lldb_script_name,
             )
-            raise RuntimeError(msg)
+            raise RedexRunException(msg, returncode, abort_error, symbolized)
 
     # Our CI system occasionally fails because it is trying to write the
     # redex-all binary when this tries to run.  This shouldn't happen, and
@@ -390,7 +414,7 @@ def zipalign(
     # Align zip and optionally perform good compression.
     try:
         zipalign = [
-            find_android_build_tool("zipalign.exe" if IS_WINDOWS else "zipalign"),
+            find_zipalign(),
             "4",
             unaligned_apk_path,
             output_apk_path,
@@ -710,15 +734,64 @@ Given an APK, produce a better APK!
     )
 
     parser.add_argument(
+        "--secondary-packed-profiles",
+        type=str,
+        help="Path to packed secondary profiles (expects tar.xz)",
+    )
+
+    parser.add_argument(
         "--jni-summary",
         default=None,
         type=str,
         help="Path to JNI summary directory of json files.",
     )
 
+    # Manual tool paths.
+
+    # Must be subclassed.
+    class ToolAction(argparse.Action):
+        def __init__(
+            self, tool_name, option_strings, dest, nargs=None, type=None, **kwargs
+        ):
+            if nargs is not None:
+                raise ValueError("nargs not allowed")
+            if type is not None:
+                raise ValueError("type not allowed")
+            super().__init__(option_strings, dest, type=str, **kwargs)
+            self.tool_name = tool_name
+
+        def __call__(self, parser, namespace, values, option_string=None):
+            if values is not None:
+                add_tool_override(self.tool_name, values)
+
+    class ZipAlignToolAction(ToolAction):
+        def __init__(self, **kwargs):
+            super().__init__("zipalign", **kwargs)
+
+    parser.add_argument(
+        "--zipalign-path",
+        default=None,
+        action=ZipAlignToolAction,
+        help="Path to zipalign executable.",
+    )
+
+    class ApkSignerToolAction(ToolAction):
+        def __init__(self, *args, **kwargs):
+            super().__init__("apksigner", *args, **kwargs)
+
+    parser.add_argument(
+        "--apksigner-path",
+        default=None,
+        action=ApkSignerToolAction,
+        help="Path to apksigner executable.",
+    )
+
     # Passthrough mode.
     parser.add_argument("--outdir", type=str)
     parser.add_argument("--dex-files", nargs="+", default=[])
+
+    parser.add_argument("--trace", type=str)
+    parser.add_argument("--trace-file", type=str)
 
     return parser
 
@@ -769,9 +842,6 @@ def _check_android_sdk(args: argparse.Namespace) -> None:
             raise RuntimeError("platforms directory does not exist")
         VERSION_REGEXP = r"android-(\d+)"
         version = max(
-            # pyre-fixme[6]: Expected `Iterable[Variable[_typeshed.SupportsLessThanT
-            #  (bound to _typeshed.SupportsLessThan)]]` for 1st param but got
-            #  `Tuple[int, *Tuple[int, ...]]`.
             (
                 -1,
                 *[
@@ -900,6 +970,33 @@ def _handle_profiles(args: argparse.Namespace) -> None:
         logging.info("No block profiles found in %s", args.packed_profiles)
 
 
+def _handle_secondary_method_profiles(args: argparse.Namespace) -> None:
+    if not args.secondary_packed_profiles:
+        return
+
+    directory = make_temp_dir(".redex_profiles", False)
+    unpack_tar_xz(args.secondary_packed_profiles, directory)
+
+    # Create input for secondary method profiles.
+    secondary_method_profiles_str = ", ".join(
+        f'"{f.path}"'
+        for f in os.scandir(directory)
+        if f.is_file()
+        and ("secondary_method_stats" in f.name or "secondary_stats" in f.name)
+    )
+    if secondary_method_profiles_str:
+        logging.debug(
+            "Found secondary_method profiles: %s", secondary_method_profiles_str
+        )
+        args.passthru_json.append(
+            f"secondary_method_stats_files=[{secondary_method_profiles_str}]"
+        )
+    else:
+        logging.info(
+            "No secondary method profiles found in %s", args.secondary_packed_profiles
+        )
+
+
 def prepare_redex(args: argparse.Namespace) -> State:
     logging.debug("Preparing...")
     debug_mode = args.unpack_only or args.debug
@@ -1010,6 +1107,7 @@ def prepare_redex(args: argparse.Namespace) -> State:
 
     # Unpack profiles, if they exist.
     _handle_profiles(args)
+    _handle_secondary_method_profiles(args)
 
     logging.debug("Moving contents to expected structure...")
     # Move each dex to a separate temporary directory to be operated by
@@ -1083,12 +1181,69 @@ def prepare_redex(args: argparse.Namespace) -> State:
     )
 
 
+def get_compression_list() -> typing.List[CompressionEntry]:
+    return [
+        CompressionEntry(
+            "Redex Instrumentation Metadata",
+            lambda args: args.enable_instrument_pass,
+            True,
+            ["redex-instrument-metadata.txt"],
+            [
+                "redex-source-block-method-dictionary.csv",
+                "redex-source-blocks.csv",
+                "redex-source-block-idom-maps.csv",
+                "unique-idom-maps.txt",
+            ],
+            "redex-instrument-metadata.zip",
+            "redex-instrument-checksum.txt",
+            CompressionLevel.BETTER,  # Not as time-sensitive.
+        ),
+        CompressionEntry(
+            "Redex Class Sizes",
+            lambda args: True,
+            True,
+            [],
+            ["redex-class-sizes.csv"],
+            None,
+            None,
+            CompressionLevel.DEFAULT,  # May be large.
+        ),
+        CompressionEntry(
+            "Redex Stats",
+            lambda args: True,
+            False,
+            ["redex-stats.txt"],
+            [],
+            None,
+            None,
+            CompressionLevel.BETTER,  # Usually small enough.
+        ),
+        CompressionEntry(
+            "Redex Class Dependencies",
+            lambda args: True,
+            True,
+            [],
+            ["redex-class-dependencies.txt"],
+            None,
+            None,
+            CompressionLevel.FAST,  # May be quite large.
+        ),
+    ]
+
+
 def finalize_redex(state: State) -> None:
     _assert_val(state.lib_manager).__exit__(*sys.exc_info())
 
     repack_start_time = timer()
 
     _assert_val(state.unpack_manager).__exit__(*sys.exc_info())
+
+    meta_file_dir = join(state.dex_dir, "meta/")
+    assert os.path.isdir(meta_file_dir), "meta dir %s does not exist" % meta_file_dir
+
+    resource_file_mapping = join(meta_file_dir, "resource-mapping.txt")
+    if os.path.exists(resource_file_mapping):
+        _assert_val(state.zip_manager).set_resource_file_mapping(resource_file_mapping)
     _assert_val(state.zip_manager).__exit__(*sys.exc_info())
 
     align_and_sign_output_apk(
@@ -1110,47 +1265,16 @@ def finalize_redex(state: State) -> None:
         )
     )
 
-    meta_file_dir = join(state.dex_dir, "meta/")
-    assert os.path.isdir(meta_file_dir), "meta dir %s does not exist" % meta_file_dir
+    compress_entries(
+        get_compression_list(),
+        meta_file_dir,
+        os.path.dirname(state.args.out),
+        state.args,
+    )
 
     copy_all_file_to_out_dir(
         meta_file_dir, state.args.out, "*", "all redex generated artifacts"
     )
-
-    if state.args.enable_instrument_pass:
-        logging.debug("Creating redex-instrument-metadata.zip")
-        zipfile_path = join(dirname(state.args.out), "redex-instrument-metadata.zip")
-
-        FILES_MUST = [
-            join(dirname(state.args.out), f) for f in ("redex-instrument-metadata.txt",)
-        ]
-
-        FILES_MAY = [
-            join(dirname(state.args.out), f)
-            for f in (
-                "redex-source-block-method-dictionary.csv",
-                "redex-source-blocks.csv",
-            )
-        ]
-        FILES_ACTUALLY = [
-            *FILES_MUST,
-            *[f for f in FILES_MAY if os.path.exists(f)],
-        ]
-
-        # Write a checksum file.
-        hash = hashlib.md5()
-        for f in FILES_ACTUALLY:
-            hash.update(open(f, "rb").read())
-        checksum_path = join(dirname(state.args.out), "redex-instrument-checksum.txt")
-        with open(checksum_path, "w") as f:
-            f.write(f"{hash.hexdigest()}\n")
-
-        with zipfile.ZipFile(zipfile_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
-            for f in [*FILES_ACTUALLY, checksum_path]:
-                z.write(f, os.path.basename(f))
-
-        for f in [*FILES_ACTUALLY, checksum_path]:
-            os.remove(f)
 
     redex_stats_filename = state.config_dict.get("stats_output", "redex-stats.txt")
     redex_stats_file = join(dirname(meta_file_dir), redex_stats_filename)
@@ -1190,7 +1314,10 @@ def _init_logging(level_str: str) -> None:
         "debug": logging.DEBUG,
     }
     level = levels[level_str]
-    logging.basicConfig(level=level)
+    logging.basicConfig(
+        level=level,
+        format="[%(levelname)-8s] %(message)s",
+    )
 
 
 def run_redex_passthrough(
@@ -1221,9 +1348,6 @@ def run_redex(
     exception_formatter: typing.Optional[ExceptionMessageFormatter] = None,
     output_line_handler: typing.Optional[typing.Callable[[str], str]] = None,
 ) -> None:
-    # This is late, but hopefully early enough.
-    _init_logging(args.log_level)
-
     with BuckConnectionScope():
         if exception_formatter is None:
             exception_formatter = ExceptionMessageFormatter()
@@ -1247,6 +1371,18 @@ def run_redex(
         finalize_redex(state)
 
 
+def early_apply_args(args: argparse.Namespace) -> None:
+    # This is late, but hopefully early enough.
+    _init_logging(args.log_level)
+
+    # Translate these to the regular environment variables.
+    if args.trace:
+        os.environ["TRACE"] = args.trace
+
+    if args.trace_file:
+        os.environ["TRACEFILE"] = args.trace_file
+
+
 if __name__ == "__main__":
     keys: typing.Dict[str, str] = {}
     try:
@@ -1258,5 +1394,6 @@ if __name__ == "__main__":
     except Exception:
         pass
     args: argparse.Namespace = arg_parser(**keys).parse_args()
+    early_apply_args(args)
     validate_args(args)
     with_temp_cleanup(lambda: run_redex(args), args.always_clean_up)

@@ -54,7 +54,7 @@ std::vector<std::unique_ptr<boost::regex>> make_rxs(
   return rxs;
 }
 
-const std::string& get_deobfuscated_name(const DexType* type) {
+std::string_view get_deobfuscated_name(const DexType* type) {
   auto cls = type_class(type);
   if (cls == nullptr) {
     return type->str();
@@ -62,11 +62,19 @@ const std::string& get_deobfuscated_name(const DexType* type) {
   return cls->get_deobfuscated_name().str();
 }
 
+const char* get_deobfuscated_name_cstr(const DexType* type) {
+  auto cls = type_class(type);
+  if (cls == nullptr) {
+    return type->c_str();
+  }
+  return cls->get_deobfuscated_name().c_str();
+}
+
 bool match_annotation_rx(const DexClass* cls, const boost::regex& annorx) {
   const auto* annos = cls->get_anno_set();
   if (!annos) return false;
   for (const auto& anno : annos->get_annotations()) {
-    if (boost::regex_match(get_deobfuscated_name(anno->type()), annorx)) {
+    if (boost::regex_match(get_deobfuscated_name_cstr(anno->type()), annorx)) {
       return true;
     }
   }
@@ -121,9 +129,9 @@ struct ClassMatcher {
 
  private:
   bool match_name(const DexClass* cls, int index) const {
-    const auto& deob_name = cls->get_deobfuscated_name();
-    auto rx = *m_cls[index];
-    return boost::regex_match(deob_name.str(), rx);
+    auto deob_name_cstr = cls->get_deobfuscated_name().c_str();
+    const auto& rx = *m_cls[index];
+    return boost::regex_match(deob_name_cstr, rx);
   }
 
   bool match_access(const DexClass* cls) const {
@@ -149,8 +157,8 @@ struct ClassMatcher {
         return false;
       }
     }
-    const auto& deob_name = cls->get_deobfuscated_name();
-    return boost::regex_match(deob_name.str(), *m_extends);
+    auto deob_name_cstr = cls->get_deobfuscated_name().c_str();
+    return boost::regex_match(deob_name_cstr, *m_extends);
   }
 
   bool search_interfaces(const DexClass* cls) {
@@ -210,7 +218,19 @@ enum class RuleType {
   WHY_ARE_YOU_KEEPING,
   KEEP,
   ASSUME_NO_SIDE_EFFECTS,
+  KEEP_NATIVE,
 };
+
+bool rule_type_is_keep(RuleType rule_type) {
+  switch (rule_type) {
+  case RuleType::KEEP:
+  case RuleType::KEEP_NATIVE:
+    return true;
+  case RuleType::ASSUME_NO_SIDE_EFFECTS:
+  case RuleType::WHY_ARE_YOU_KEEPING:
+    return false;
+  }
+}
 
 std::string to_string(RuleType rule_type) {
   switch (rule_type) {
@@ -220,6 +240,8 @@ std::string to_string(RuleType rule_type) {
     return "classes and members";
   case RuleType::ASSUME_NO_SIDE_EFFECTS:
     return "assumenosideeffects";
+  case RuleType::KEEP_NATIVE:
+    return "classes with native members";
   }
 }
 
@@ -317,11 +339,12 @@ class KeepRuleMatcher {
   bool has_annotation(const DexMember* member,
                       const std::string& annotation) const;
 
-  boost::regex register_matcher(const std::string& regex) const {
-    if (!m_regex_map.count(regex)) {
-      m_regex_map.emplace(regex, boost::regex{regex});
+  const boost::regex& register_matcher(const std::string& regex) const {
+    auto it = m_regex_map.find(regex);
+    if (it == m_regex_map.end()) {
+      it = m_regex_map.emplace(regex, boost::regex{regex}).first;
     }
-    return m_regex_map.at(regex);
+    return it->second;
   }
 
   bool is_unused() const {
@@ -366,7 +389,8 @@ class ProguardMatcher {
   void process_proguard_rules(const ProguardConfiguration& pg_config);
   void mark_all_annotation_classes_as_keep();
 
-  void process_keep(const KeepSpecSet& keep_rules,
+  void process_keep(KeepSpecSet::iterator keep_rules_begin,
+                    KeepSpecSet::iterator keep_rules_end,
                     RuleType rule_type,
                     bool process_external = false);
 
@@ -417,7 +441,7 @@ void apply_assume_method_return_value(const KeepSpec& k, DexMember* member) {
 }
 
 // Updates a class, field or method to add keep modifiers.
-// Note: includedescriptorclasses and allowoptimization are not implemented.
+// Note: allowoptimization is not implemented.
 template <class DexMember>
 void apply_keep_modifiers(const KeepSpec& k, DexMember* member) {
   // We only set allowshrinking when no other keep rule has been applied to this
@@ -448,6 +472,11 @@ void apply_keep_modifiers(const KeepSpec& k, DexMember* member) {
   } else {
     impl::KeepState::unset_allowobfuscation(member);
   }
+
+  // Always apply `includedescriptorclasses` if it was set by a keep rule.
+  if (k.includedescriptorclasses) {
+    impl::KeepState::set_includedescriptorclasses(member);
+  }
 }
 
 template <class DexMember>
@@ -467,7 +496,7 @@ bool KeepRuleMatcher::has_annotation(const DexMember* member,
     auto annotation_regex = proguard_parser::form_type_regex(annotation);
     const boost::regex& annotation_matcher = register_matcher(annotation_regex);
     for (const auto& anno : annos->get_annotations()) {
-      if (boost::regex_match(get_deobfuscated_name(anno->type()),
+      if (boost::regex_match(get_deobfuscated_name_cstr(anno->type()),
                              annotation_matcher)) {
         return true;
       }
@@ -476,20 +505,20 @@ bool KeepRuleMatcher::has_annotation(const DexMember* member,
   return false;
 }
 
-// From a fully qualified descriptor for a field, exract just the
+// From a fully qualified descriptor for a field, extract just the
 // name of the field which occurs between the ;. and : characters.
-std::string extract_field_name(std::string qualified_fieldname) {
+const char* extract_field_name_cstr(const std::string& qualified_fieldname) {
   auto p = qualified_fieldname.find(";.");
   if (p == std::string::npos) {
-    return qualified_fieldname;
+    return qualified_fieldname.c_str();
   }
-  return qualified_fieldname.substr(p + 2);
+  return qualified_fieldname.c_str() + p + 2;
 }
 
-std::string extract_method_name_and_type(
-    const std::string& qualified_fieldname) {
-  auto p = qualified_fieldname.find(";.");
-  return qualified_fieldname.substr(p + 2);
+const char* extract_method_name_and_type_cstr(
+    const DexString& qualified_fieldname) {
+  auto p = qualified_fieldname.str().find(";.");
+  return qualified_fieldname.c_str() + p + 2;
 }
 
 bool KeepRuleMatcher::field_level_match(
@@ -509,8 +538,9 @@ bool KeepRuleMatcher::field_level_match(
     return false;
   }
   // Match field name against regex.
-  auto dequalified_name = extract_field_name(field->get_deobfuscated_name());
-  return boost::regex_match(dequalified_name, fieldname_regex);
+  auto dequalified_name_cstr =
+      extract_field_name_cstr(field->get_deobfuscated_name());
+  return boost::regex_match(dequalified_name_cstr, fieldname_regex);
 }
 
 template <class Container>
@@ -521,7 +551,7 @@ void KeepRuleMatcher::keep_fields(const Container& fields,
     if (!field_level_match(fieldSpecification, field, fieldname_regex)) {
       continue;
     }
-    if (m_rule_type == RuleType::KEEP) {
+    if (rule_type_is_keep(m_rule_type)) {
       apply_keep_modifiers(m_keep_rule, field);
     }
     if (m_rule_type == RuleType::ASSUME_NO_SIDE_EFFECTS) {
@@ -563,9 +593,9 @@ bool KeepRuleMatcher::method_level_match(
                       method->get_access())) {
     return false;
   }
-  auto dequalified_name =
-      extract_method_name_and_type(method->get_deobfuscated_name().str());
-  return boost::regex_match(dequalified_name.c_str(), method_regex);
+  auto dequalified_name_cstr =
+      extract_method_name_and_type_cstr(method->get_deobfuscated_name());
+  return boost::regex_match(dequalified_name_cstr, method_regex);
 }
 
 template <class Container>
@@ -575,13 +605,26 @@ void KeepRuleMatcher::keep_methods(
     const boost::regex& method_regex) {
   for (DexMethod* method : methods) {
     if (method_level_match(methodSpecification, method, method_regex)) {
-      if (m_rule_type == RuleType::KEEP) {
+      bool could_delete = can_delete(method);
+      switch (m_rule_type) {
+      case RuleType::KEEP:
+      case RuleType::KEEP_NATIVE: {
         apply_keep_modifiers(m_keep_rule, method);
+        break;
       }
-      if (m_rule_type == RuleType::ASSUME_NO_SIDE_EFFECTS) {
+      case RuleType::ASSUME_NO_SIDE_EFFECTS:
         apply_assume_method_return_value(m_keep_rule, method);
+        break;
+      case RuleType::WHY_ARE_YOU_KEEPING:
+        break;
       }
       apply_rule(method);
+
+      if (m_rule_type == RuleType::KEEP_NATIVE) {
+        if (could_delete && !can_delete(method)) {
+          g_redex->blanket_native_root_methods.insert(method);
+        }
+      }
     }
   }
 }
@@ -696,14 +739,6 @@ void KeepRuleMatcher::mark_class_and_members_for_keep(DexClass* cls) {
       return;
     }
   }
-  // Mark descriptor classes
-  if (m_keep_rule.includedescriptorclasses) {
-    std::ostringstream oss;
-    oss << "WARNING: 'includedescriptorclasses' keep modifier is NOT "
-           "implemented: "
-        << show_keep(m_keep_rule);
-    maybe_warn(oss.str());
-  }
   if (m_keep_rule.allowoptimization) {
     std::ostringstream oss;
     oss << "WARNING: 'allowoptimization' keep modifier is NOT implemented: "
@@ -711,8 +746,14 @@ void KeepRuleMatcher::mark_class_and_members_for_keep(DexClass* cls) {
     maybe_warn(oss.str());
   }
   if (m_keep_rule.mark_classes || m_keep_rule.mark_conditionally) {
+    bool could_delete = can_delete(cls);
     apply_keep_modifiers(m_keep_rule, cls);
     impl::KeepState::set_has_keep(cls, &m_keep_rule);
+    if (m_rule_type == RuleType::KEEP_NATIVE) {
+      if (could_delete && !can_delete(cls)) {
+        g_redex->blanket_native_root_classes.insert(cls);
+      }
+    }
     ++m_class_matches;
     if (cls->rstate.report_whyareyoukeeping()) {
       TRACE(PGR, 2, "whyareyoukeeping Class %s kept by %s",
@@ -758,12 +799,26 @@ void KeepRuleMatcher::apply_rule(DexMember* member) {
   case RuleType::WHY_ARE_YOU_KEEPING:
     member->rstate.set_whyareyoukeeping();
     break;
-  case RuleType::KEEP: {
+  case RuleType::KEEP:
+  case RuleType::KEEP_NATIVE: {
     impl::KeepState::set_has_keep(member, &m_keep_rule);
     ++m_member_matches;
     if (member->rstate.report_whyareyoukeeping()) {
       TRACE(PGR, 2, "whyareyoukeeping %s kept by %s", SHOW(member),
             show_keep(m_keep_rule).c_str());
+    }
+    if (impl::KeepState::includedescriptorclasses(member)) {
+      std::vector<DexType*> types;
+      member->gather_types_shallow(types);
+      for (auto* type : types) {
+        if (auto* cls = type_class(type)) {
+          impl::KeepState::set_has_keep(cls, &m_keep_rule);
+          if (cls->rstate.report_whyareyoukeeping()) {
+            TRACE(PGR, 2, "whyareyoukeeping %s kept by %s", SHOW(cls),
+                  show_keep(m_keep_rule).c_str());
+          }
+        }
+      }
     }
     break;
   }
@@ -779,6 +834,7 @@ void KeepRuleMatcher::keep_processor(DexClass* cls) {
     process_whyareyoukeeping(cls);
     break;
   case RuleType::KEEP:
+  case RuleType::KEEP_NATIVE:
     mark_class_and_members_for_keep(cls);
     break;
   case RuleType::ASSUME_NO_SIDE_EFFECTS:
@@ -790,9 +846,9 @@ void KeepRuleMatcher::keep_processor(DexClass* cls) {
 DexClass* ProguardMatcher::find_single_class(
     const std::string& descriptor) const {
   auto const& dsc = java_names::external_to_internal(descriptor);
-  DexType* typ = DexType::get_type(m_pg_map.translate_class(dsc).c_str());
+  DexType* typ = DexType::get_type(m_pg_map.translate_class(dsc));
   if (typ == nullptr) {
-    typ = DexType::get_type(dsc.c_str());
+    typ = DexType::get_type(dsc);
     if (typ == nullptr) {
       return nullptr;
     }
@@ -800,7 +856,8 @@ DexClass* ProguardMatcher::find_single_class(
   return type_class(typ);
 }
 
-void ProguardMatcher::process_keep(const KeepSpecSet& keep_rules,
+void ProguardMatcher::process_keep(KeepSpecSet::iterator keep_rules_begin,
+                                   KeepSpecSet::iterator keep_rules_end,
                                    RuleType rule_type,
                                    bool process_external) {
   Timer t("Process keep for " + to_string(rule_type));
@@ -848,8 +905,8 @@ void ProguardMatcher::process_keep(const KeepSpecSet& keep_rules,
   });
 
   RegexMap regex_map;
-  for (const auto& keep_rule_ptr : keep_rules) {
-    const auto& keep_rule = *keep_rule_ptr;
+  for (auto it = keep_rules_begin; it != keep_rules_end; ++it) {
+    const auto& keep_rule = *(*it);
     ClassMatcher class_match(keep_rule);
 
     bool has_negation = std::any_of(keep_rule.class_spec.classNames.begin(),
@@ -907,9 +964,22 @@ void ProguardMatcher::process_proguard_rules(
     const ProguardConfiguration& pg_config) {
   // Now process each of the different kinds of rules as well
   // as -assumenosideeffects and -whyareyoukeeping.
-  process_keep(pg_config.whyareyoukeeping_rules, RuleType::WHY_ARE_YOU_KEEPING);
-  process_keep(pg_config.keep_rules, RuleType::KEEP);
-  process_keep(pg_config.assumenosideeffects_rules,
+  process_keep(pg_config.whyareyoukeeping_rules.begin(),
+               pg_config.whyareyoukeeping_rules.end(),
+               RuleType::WHY_ARE_YOU_KEEPING);
+
+  auto keep_rules_native_begin =
+      pg_config.keep_rules_native_begin.value_or(pg_config.keep_rules.end());
+
+  process_keep(pg_config.keep_rules.begin(), keep_rules_native_begin,
+               RuleType::KEEP);
+
+  process_keep(keep_rules_native_begin,
+               pg_config.keep_rules.end(),
+               RuleType::KEEP_NATIVE);
+
+  process_keep(pg_config.assumenosideeffects_rules.begin(),
+               pg_config.assumenosideeffects_rules.end(),
                RuleType::ASSUME_NO_SIDE_EFFECTS,
                /* process_external = */ true);
 }

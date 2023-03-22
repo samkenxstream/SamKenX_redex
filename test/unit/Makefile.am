@@ -22,6 +22,7 @@ check_PROGRAMS = \
     cfg_inliner_test \
     cfg_mutation_test \
     cfg_positions_test \
+    class_checker_test \
     check_breadcrumbs_test \
     check_cast_analysis_test \
     concurrent_containers_test \
@@ -42,6 +43,7 @@ check_PROGRAMS = \
     dex_mutate_test \
     dex_output_test \
     dex_store_test \
+    dex_structure_test \
     dex_type_environment_test \
     dex_util_test \
     dominators_test \
@@ -108,7 +110,6 @@ check_PROGRAMS = \
     reg_alloc_test \
     registers_test \
     remove_apilevel_checks_test \
-    remove_gotos_test \
     remove_null_check_string_arg_test \
     remove_recursive_locks_test \
     remove_redundant_check_casts_test \
@@ -141,7 +142,8 @@ check_PROGRAMS = \
     virtual_merging_test \
     walkers_test \
     work_queue_test \
-    xstorerefs_test
+    xstorerefs_test \
+    string_tree_test
 
 aliased_registers_test_SOURCES = AliasedRegistersTest.cpp
 
@@ -169,6 +171,8 @@ cfg_positions_test_LDADD = $(COMMON_MOCK_TEST_LIBS)
 check_breadcrumbs_test_SOURCES = CheckBreadCrumbsTest.cpp
 
 check_cast_analysis_test_SOURCES = CheckCastAnalysisTest.cpp
+
+class_checker_test_SOURCES = ClassCheckerTest.cpp ScopeHelper.cpp
 
 concurrent_containers_test_SOURCES = ConcurrentContainersTest.cpp
 
@@ -209,6 +213,8 @@ dex_mutate_test_SOURCES = DexMutateTest.cpp
 dex_output_test_SOURCES = DexOutputTest.cpp
 
 dex_store_test_SOURCES = DexStoreTest.cpp
+
+dex_structure_test_SOURCES = DexStructureTest.cpp
 
 dex_type_environment_test_SOURCES = type-analysis/DexTypeEnvironmentTest.cpp
 
@@ -363,8 +369,6 @@ registers_test_SOURCES = RegistersTest.cpp OpcodeList.cpp
 remove_apilevel_checks_test_SOURCES = RemoveApiLevelChecksTest.cpp
 remove_apilevel_checks_test_LDADD = $(COMMON_MOCK_TEST_LIBS)
 
-remove_gotos_test_SOURCES = RemoveGotosTest.cpp VirtScopeHelper.cpp ScopeHelper.cpp
-
 remove_null_check_string_arg_test_SOURCES = RemoveNullCheckStringArgTest.cpp ScopeHelper.cpp
 
 remove_recursive_locks_test_SOURCES = RemoveRecursiveLocksTest.cpp
@@ -398,6 +402,8 @@ split_huge_switch_test_SOURCES = SplitHugeSwitchTest.cpp
 static_relo_v2_test_SOURCES = StaticReloV2Test.cpp
 
 # stringbuilder_outline_test_SOURCES = StringBuilderOutlinerTest.cpp
+
+string_propagation_test_SOURCES = constant-propagation/StringPropagationTest.cpp
 
 strip_debug_info_test_SOURCES = StripDebugInfoTest.cpp
 
@@ -448,6 +454,8 @@ work_queue_test_SOURCES = WorkQueueTest.cpp
 
 xstorerefs_test_SOURCES = XStoreRefsTest.cpp
 
+string_tree_test_SOURCES = StringTreeTest.cpp
+
 
 TESTS = \
     aliased_registers_test \
@@ -461,6 +469,7 @@ TESTS = \
     cfg_positions_test \
     check_breadcrumbs_test \
     check_cast_analysis_test \
+    class_checker_test \
     concurrent_containers_test \
     configurable_test \
     constructor_analysis_test \
@@ -479,6 +488,7 @@ TESTS = \
     dex_mutate_test \
     dex_output_test \
     dex_store_test \
+    dex_structure_test \
     dex_type_environment_test \
     dex_util_test \
     dominators_test \
@@ -540,7 +550,6 @@ TESTS = \
     reg_alloc_test \
     registers_test \
     remove_apilevel_checks_test \
-    remove_gotos_test \
     remove_null_check_string_arg_test \
     remove_recursive_locks_test \
     remove_redundant_check_casts_test \
@@ -573,4 +582,5 @@ TESTS = \
     virtual_merging_test \
     walkers_test \
     work_queue_test \
-    xstorerefs_test
+    xstorerefs_test \
+    string_tree_test

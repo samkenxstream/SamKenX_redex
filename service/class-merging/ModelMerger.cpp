@@ -27,7 +27,6 @@ using namespace class_merging;
 
 namespace {
 
-using MergedTypeNames = std::unordered_map<std::string, std::string>;
 using CallSites = std::vector<std::pair<DexMethod*, IRInstruction*>>;
 
 const std::string TE_MAPPING_FILE_NAME = "redex-type-erasure-mappings.txt";
@@ -94,6 +93,19 @@ MergerToField get_type_tag_fields(const std::vector<const MergerType*>& mergers,
   return merger_to_type_tag_field;
 }
 
+/*
+ * INSTANCE_OF needs special treatment involving the type tag.
+ */
+bool is_simple_type_ref(IRInstruction* insn) {
+  if (!insn->has_type()) {
+    return false;
+  }
+  return opcode::is_new_instance(insn->opcode()) ||
+         opcode::is_check_cast(insn->opcode()) ||
+         opcode::is_const_class(insn->opcode()) ||
+         opcode::is_new_array(insn->opcode());
+}
+
 void update_code_type_refs(
     const Scope& scope,
     const std::unordered_map<const DexType*, DexType*>& mergeable_to_merger) {
@@ -145,13 +157,7 @@ void update_code_type_refs(
       ////////////////////////////////////////
       // Update simple type refs
       ////////////////////////////////////////
-      if (!insn->has_type()) {
-        continue;
-      }
-      if (insn->opcode() != OPCODE_NEW_INSTANCE &&
-          insn->opcode() != OPCODE_CHECK_CAST &&
-          insn->opcode() != OPCODE_CONST_CLASS &&
-          insn->opcode() != OPCODE_NEW_ARRAY) {
+      if (!is_simple_type_ref(insn)) {
         continue;
       }
       const auto ref_type = insn->get_type();
@@ -519,7 +525,6 @@ std::vector<DexClass*> ModelMerger::merge_model(Scope& scope,
   Timer t("merge_model");
   std::vector<const MergerType*> to_materialize;
   std::vector<DexClass*> merger_classes;
-  MergedTypeNames merged_type_names;
   const auto model_spec = model.get_model_spec();
   bool input_has_type_tag = model_spec.input_has_type_tag();
 
@@ -581,7 +586,6 @@ std::vector<DexClass*> ModelMerger::merge_model(Scope& scope,
     auto type = const_cast<DexType*>(merger->type);
     for (auto mergeable : merger->mergeables) {
       loosen_access_modifier_except_vmethods(type_class(mergeable));
-      merged_type_names[mergeable->get_name()->str()] = type->get_name()->str();
       mergeable_to_merger[mergeable] = type;
     }
   }
@@ -620,7 +624,7 @@ std::vector<DexClass*> ModelMerger::merge_model(Scope& scope,
   rewriter::TypeStringMap type_str_mapping(mergeable_to_merger);
   rewriter::rewrite_dalvik_annotation_signature(scope, type_str_mapping);
 
-  if (model_spec.replace_type_like_const_strings) {
+  if (model_spec.replace_type_like_strings()) {
     rewriter::rewrite_string_literal_instructions(scope, type_str_mapping);
   }
 

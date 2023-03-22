@@ -69,9 +69,10 @@ def compress_tar_xz(inputs):
 
     for input in inputs:
         logging.info("Adding %s", input)
-        info = tar.gettarinfo(input)
-        info.name = os.path.basename(input)
+        # In case the inputs are symlinks, it's better to work with the file
+        # object outright.
         with open(input, "rb") as f:
+            info = tar.gettarinfo(arcname=os.path.basename(input), fileobj=f)
             tar.addfile(info, fileobj=f)
 
     tar.close()
@@ -164,7 +165,7 @@ def write_py_wrapper(base_64_bytes_blob, files, filename, tar_xz):
                 compression_specific_api=_TAR_XZ_API if tar_xz else _ZIP_API,
             )
         )
-        for key, val in files.items():
+        for key, val in list(files.items()):
             f.write(f'{key} = _load("{os.path.basename(val)}")\n')
 
 
@@ -174,7 +175,7 @@ def main():
         key_val[: key_val.find("=")]: key_val[key_val.find("=") + 1 :]
         for key_val in args.inputs
     }
-    base64_blob = compress_and_base_64(files.values(), args.tarxz)
+    base64_blob = compress_and_base_64(list(files.values()), args.tarxz)
     write_py_wrapper(base64_blob, files, args.output, args.tarxz)
 
 

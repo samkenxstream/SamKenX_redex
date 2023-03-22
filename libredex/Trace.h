@@ -66,6 +66,7 @@ class DexType;
   TM(ICL)               \
   TM(ICONSTP)           \
   TM(IDEX)              \
+  TM(IDEXR)             \
   TM(IFCS_ANALYSIS)     \
   TM(INL)               \
   TM(INLINE)            \
@@ -97,6 +98,7 @@ class DexType;
   TM(NULLCHECK)         \
   TM(OBFUSCATE)         \
   TM(OEA)               \
+  TM(OBFUS_RES)         \
   TM(OPTRES)            \
   TM(OPT_STORES)        \
   TM(OPUT)              \
@@ -115,6 +117,7 @@ class DexType;
   TM(RAL)               \
   TM(RBB)               \
   TM(REACH)             \
+  TM(REFC)              \
   TM(REFL)              \
   TM(REFU)              \
   TM(REG)               \
@@ -134,6 +137,7 @@ class DexType;
   TM(SDIS)              \
   TM(SHORTEN)           \
   TM(SPLIT_RES)         \
+  TM(SRC_PASS)          \
   TM(STATIC_RELO)       \
   TM(STATS)             \
   TM(STRBUILD)          \

@@ -66,7 +66,7 @@ const std::string& IODIMetadata::get_layered_name(const std::string& base_name,
   return storage;
 }
 
-void IODIMetadata::mark_methods(DexStoresVector& scope) {
+void IODIMetadata::mark_methods(DexStoresVector& scope, bool iodi_layers) {
   // Calculates which methods won't collide with other methods when printed
   // in a stack trace (e.g. due to method overloading or templating).
   // Before IODI we disambiguated stack trace lines by using a proguard mapping
@@ -77,38 +77,36 @@ void IODIMetadata::mark_methods(DexStoresVector& scope) {
   //
   // We do this linearly for now because otherwise we need locks
 
-  std::unordered_map<std::string, DexMethod*> name_method_map;
+  // IODI only supports non-ambiguous methods, i.e., an overload cluster is
+  // only a single method. Layered IODI supports as many overloads as can
+  // be encoded.
+  const size_t large_bound = iodi_layers ? DexOutput::kIODILayerBound : 1;
 
-  std::unordered_map<std::string, const DexMethod*> name_map;
-  auto emplace_entry = [&](const std::string& str, DexMethod* m) {
-    {
-      const DexMethod* canonical;
-      auto it = name_map.find(str);
-      if (it == name_map.end()) {
-        canonical = m;
-        name_map.emplace(str, m);
-      } else {
-        canonical = m_canonical.at(it->second);
-      }
-      m_canonical[m] = canonical;
-      m_name_clusters[canonical].insert(m);
-    }
-
-    auto iter = name_method_map.find(str);
-    if (iter != name_method_map.end()) {
-      auto name_iter = m_method_to_name.find(iter->second);
-      if (name_iter != m_method_to_name.end()) {
-        m_method_to_name.erase(name_iter);
-      }
-      iter->second = nullptr;
-    } else {
-      name_method_map.emplace(str, m);
-      m_method_to_name.emplace(m, str);
-    }
-  };
   for (auto& store : scope) {
     for (auto& classes : store.get_dexen()) {
       for (auto& cls : classes) {
+        std::unordered_map<std::string, std::pair<const DexMethod*, size_t>>
+            name_map;
+
+        auto emplace_entry = [this, &name_map, large_bound](
+                                 const std::string& str, DexMethod* m) {
+          auto it = name_map.find(str);
+          if (it == name_map.end()) {
+            name_map[str] = {m, 1};
+          } else {
+            const DexMethod* canonical = it->second.first;
+            auto& count = it->second.second;
+
+            count++;
+            m_canonical[m] = canonical;
+            m_canonical[canonical] = canonical;
+
+            if (count > large_bound) {
+              m_too_large_cluster_canonical_methods.insert(canonical);
+            }
+          }
+        };
+
         auto pretty_prefix = pretty_prefix_for_cls(cls);
         // First we need to mark all entries...
         for (DexMethod* m : cls->get_dmethods()) {
@@ -125,13 +123,12 @@ void IODIMetadata::mark_methods(DexStoresVector& scope) {
 }
 
 void IODIMetadata::set_iodi_layer(const DexMethod* method, size_t layer) {
-  m_iodi_method_layers.emplace(method,
-                               std::make_pair(get_iodi_name(method), layer));
+  m_iodi_method_layers.emplace(method, layer);
 }
 
 size_t IODIMetadata::get_iodi_layer(const DexMethod* method) const {
   auto it = m_iodi_method_layers.find(method);
-  return it != m_iodi_method_layers.end() ? it->second.second : 0u;
+  return it != m_iodi_method_layers.end() ? it->second : 0u;
 }
 
 bool IODIMetadata::has_iodi_layer(const DexMethod* method) const {
@@ -195,15 +192,13 @@ void IODIMetadata::write(
   size_t max_layer{0};
   size_t layered_count{0};
 
-  for (const auto& p : m_iodi_method_layers) {
+  for (const auto& [method, layer] : m_iodi_method_layers) {
     count += 1;
     always_assert_log(count != 0, "Too many entries found, overflowed");
 
-    auto* method = p.first;
-    const auto& name = p.second.first;
-    auto layer = p.second.second;
     redex_assert(layer < DexOutput::kIODILayerBound);
 
+    auto name = get_iodi_name(method);
     std::string tmp;
     const std::string& layered_name = get_layered_name(name, layer, tmp);
 

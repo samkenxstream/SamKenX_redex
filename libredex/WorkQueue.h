@@ -22,7 +22,7 @@ struct NoStateWorkQueueHelper {
   Fn fn;
   void operator()(sparta::SpartaWorkerState<Input>*, Input a) {
     try {
-      fn(a);
+      fn(std::move(a));
     } catch (std::exception& e) {
       redex_queue_exception_handler(e);
       throw;
@@ -35,7 +35,7 @@ struct WithStateWorkQueueHelper {
   Fn fn;
   void operator()(sparta::SpartaWorkerState<Input>* state, Input a) {
     try {
-      fn(state, a);
+      fn(state, std::move(a));
     } catch (std::exception& e) {
       redex_queue_exception_handler(e);
       throw;
@@ -103,8 +103,8 @@ void workqueue_run(
       redex_workqueue_impl::NoStateWorkQueueHelper<Input, Fn>{fn},
       num_threads,
       push_tasks_while_running);
-  for (auto& item : items) {
-    wq.add_item(item);
+  for (Input item : items) {
+    wq.add_item(std::move(item));
   }
   wq.run_all();
 }
@@ -123,8 +123,8 @@ void workqueue_run(
       redex_workqueue_impl::NoStateWorkQueueHelper<Input, Fn>{fn},
       num_threads,
       push_tasks_while_running);
-  for (auto& item : items) {
-    wq.add_item(item);
+  for (Input item : items) {
+    wq.add_item(std::move(item));
   }
   wq.run_all();
 }
@@ -143,8 +143,8 @@ void workqueue_run(
       redex_workqueue_impl::WithStateWorkQueueHelper<Input, Fn>{fn},
       num_threads,
       push_tasks_while_running);
-  for (auto& item : items) {
-    wq.add_item(item);
+  for (Input item : items) {
+    wq.add_item(std::move(item));
   }
   wq.run_all();
 }
@@ -163,8 +163,25 @@ void workqueue_run(
       redex_workqueue_impl::WithStateWorkQueueHelper<Input, Fn>{fn},
       num_threads,
       push_tasks_while_running);
-  for (auto& item : items) {
-    wq.add_item(item);
+  for (Input item : items) {
+    wq.add_item(std::move(item));
+  }
+  wq.run_all();
+}
+template <class InteralType, typename Fn>
+void workqueue_run_for(
+    InteralType start,
+    InteralType end,
+    const Fn& fn,
+    unsigned int num_threads = redex_parallel::default_num_threads()) {
+  auto wq = sparta::SpartaWorkQueue<
+      InteralType,
+      redex_workqueue_impl::NoStateWorkQueueHelper<InteralType, Fn>>(
+      redex_workqueue_impl::NoStateWorkQueueHelper<InteralType, Fn>{fn},
+      num_threads,
+      /* push_tasks_while_running */ false);
+  for (InteralType i = start; i < end; i++) {
+    wq.add_item(i);
   }
   wq.run_all();
 }

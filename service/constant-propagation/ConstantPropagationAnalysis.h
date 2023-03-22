@@ -11,6 +11,7 @@
 #include <unordered_set>
 #include <utility>
 
+#include "BaseIRAnalyzer.h"
 #include "ConcurrentContainers.h"
 #include "ConstantEnvironment.h"
 #include "IRCode.h"
@@ -30,8 +31,7 @@ boost::optional<size_t> get_null_check_object_index(
 namespace intraprocedural {
 
 class FixpointIterator final
-    : public sparta::MonotonicFixpointIterator<cfg::GraphInterface,
-                                               ConstantEnvironment> {
+    : public ir_analyzer::BaseEdgeAwareIRAnalyzer<ConstantEnvironment> {
  public:
   /*
    * The fixpoint iterator takes an optional WholeProgramState argument that
@@ -41,21 +41,22 @@ class FixpointIterator final
                    InstructionAnalyzer<ConstantEnvironment> insn_analyzer,
                    bool imprecise_switches = false);
 
-  ConstantEnvironment analyze_edge(
-      const EdgeId&,
-      const ConstantEnvironment& exit_state_at_source) const override;
-
-  void analyze_instruction(const IRInstruction* insn,
-                           ConstantEnvironment* env,
-                           bool is_last) const;
-
-  void analyze_instruction_no_throw(const IRInstruction* insn,
-                                    ConstantEnvironment* current_state) const;
-
-  void analyze_node(const NodeId& block,
-                    ConstantEnvironment* state_at_entry) const override;
-
   void clear_switch_succ_cache() const { m_switch_succs.clear(); }
+
+ protected:
+  void analyze_instruction_normal(const IRInstruction* insn,
+                                  ConstantEnvironment* env) const override;
+
+  void analyze_if(const IRInstruction* insn,
+                  cfg::Edge* const& edge,
+                  ConstantEnvironment* env) const override;
+
+  void analyze_switch(const IRInstruction* insn,
+                      cfg::Edge* const& edge,
+                      ConstantEnvironment* env) const override;
+
+  void analyze_no_throw(const IRInstruction* insn,
+                        ConstantEnvironment* env) const override;
 
  private:
   using SwitchSuccs = std::unordered_map<int32_t, uint32_t>;
@@ -310,6 +311,8 @@ struct ImmutableAttributeAnalyzerState {
 
   ImmutableAttributeAnalyzerState();
 
+  // Immutable state should not be updated in parallel with analysis!
+
   Initializer& add_initializer(DexMethod* initialize_method, DexMethod* attr);
   Initializer& add_initializer(DexMethod* initialize_method, DexField* attr);
   Initializer& add_initializer(DexMethod* initialize_method,
@@ -383,6 +386,8 @@ class StringAnalyzer
     env->set(RESULT_REGISTER, StringDomain(insn->get_string()));
     return true;
   }
+
+  static bool analyze_invoke(const IRInstruction*, ConstantEnvironment*);
 };
 
 class ConstantClassObjectAnalyzer
@@ -556,6 +561,7 @@ using ConstantPrimitiveAndBoxedAnalyzer =
                                 ImmutableAttributeAnalyzer,
                                 EnumFieldAnalyzer,
                                 BoxedBooleanAnalyzer,
+                                StringAnalyzer,
                                 ApiLevelAnalyzer,
                                 PrimitiveAnalyzer>;
 

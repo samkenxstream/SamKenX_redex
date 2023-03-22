@@ -20,6 +20,7 @@
 #include "InstructionLowering.h"
 #include "PassManager.h"
 #include "RedexContext.h"
+#include "RedexOptions.h"
 #include "RedexTestUtils.h"
 #include "SanitizersConfig.h"
 #include "Show.h"
@@ -50,7 +51,7 @@ static const char* VOID_RETURN_OBJECT_PROTO = "()Ljava/lang/Object;";
 static const char* VOID_RETURN_STRING_PROTO = "()Ljava/lang/String;";
 
 void testReadDex(const char* dexfile) {
-  DexLoader dl(dexfile);
+  DexLoader dl(DexLocation::make_location("", dexfile));
   dex_stats_t stats{{0}};
   auto classes = dl.load_dex(dexfile, &stats, 38);
   auto idx = dl.get_idx();
@@ -111,7 +112,7 @@ void testReadDex(const char* dexfile) {
   //   target_type : ()Ljava/lang/String;
   int lambdaRun2MethodHandleIdx = ensureMethodHandle(idx, [](DexMethodHandle* mh) {
     return
-      mh->type(), METHOD_HANDLE_TYPE_INVOKE_STATIC &&
+      mh->type() == METHOD_HANDLE_TYPE_INVOKE_STATIC &&
       !strcmp(mh->methodref()->get_name()->c_str(), "lambda$run$2") &&
       !strcmp(mh->methodref()->get_class()->get_name()->c_str(), DEX038_CLASS_NAME) &&
       !strcmp(SHOW(mh->methodref()->get_proto()), VOID_RETURN_STRING_PROTO);
@@ -324,7 +325,8 @@ TEST(Dex038Test, ReadWriteDex038) {
   DexMetadata dm;
   dm.set_id("classes");
   DexStore root_store(dm);
-  root_store.add_classes(load_classes_from_dex(dexfile, true, true, 38));
+  root_store.add_classes(load_classes_from_dex(
+      DexLocation::make_location("dex", dexfile), true, true, 38));
   DexClasses& classes = root_store.get_dexen().back();
   std::vector<DexStore> stores;
   stores.emplace_back(std::move(root_store));
@@ -339,7 +341,6 @@ TEST(Dex038Test, ReadWriteDex038) {
   Json::Value conf_obj = Json::nullValue;
   auto tmpdir = redex::make_tmp_dir("dex038_test_%%%%%%%%");
   ConfigFiles dummy_cfg(conf_obj, tmpdir.path);
-  RedexOptions dummy_options;
 
   std::string metafiles = tmpdir.path + "/meta";
   int status = mkdir(metafiles.c_str(), 0755);
@@ -352,15 +353,16 @@ TEST(Dex038Test, ReadWriteDex038) {
   std::string output_dex = tmpdir.path + "/output.dex";
   auto gtypes = std::make_shared<GatheredTypes>(&classes);
 
-  write_classes_to_dex(dummy_options,
-                       output_dex,
+  write_classes_to_dex(output_dex,
                        &classes,
                        std::move(gtypes),
                        nullptr,
                        0,
+                       nullptr,
                        0,
                        dummy_cfg,
                        pos_mapper.get(),
+                       DebugInfoKind::NoCustomSymbolication,
                        &method_to_id,
                        &code_debug_lines,
                        nullptr,

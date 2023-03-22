@@ -89,7 +89,13 @@ bool RegisterTypeAnalyzer::analyze_aget(const IRInstruction* insn,
   auto idx_opt = env->get(insn->src(1)).get_constant();
   auto nullness = env->get(insn->src(0)).get_array_element_nullness(idx_opt);
   const auto ctype = type::get_array_component_type(*array_type);
-  env->set(RESULT_REGISTER, DexTypeDomain(ctype, nullness.element()));
+  auto cls = type_class(ctype);
+  bool is_type_exact = cls && !cls->is_external() && is_final(cls);
+  // is_type_exact is to decide whether to populate the
+  // small-set-dex-type-domain, which should only hold exact (non-interface)
+  // class (and possibly java.lang.Throwable, but we ignore that here).
+  env->set(RESULT_REGISTER,
+           DexTypeDomain(ctype, nullness.element(), is_type_exact));
   return true;
 }
 
@@ -142,65 +148,57 @@ bool RegisterTypeAnalyzer::analyze_binop_lit(const IRInstruction* insn,
 
   bool use_result_reg = false;
   switch (op) {
-  case OPCODE_ADD_INT_LIT16:
-  case OPCODE_ADD_INT_LIT8: {
+  case OPCODE_ADD_INT_LIT: {
     result = (*int_val) + lit;
     break;
   }
-  case OPCODE_RSUB_INT:
-  case OPCODE_RSUB_INT_LIT8: {
+  case OPCODE_RSUB_INT_LIT: {
     result = lit - (*int_val);
     break;
   }
-  case OPCODE_MUL_INT_LIT16:
-  case OPCODE_MUL_INT_LIT8: {
+  case OPCODE_MUL_INT_LIT: {
     result = (*int_val) * lit;
     break;
   }
-  case OPCODE_DIV_INT_LIT16:
-  case OPCODE_DIV_INT_LIT8: {
+  case OPCODE_DIV_INT_LIT: {
     if (lit != 0) {
       result = (*int_val) / lit;
     }
     use_result_reg = true;
     break;
   }
-  case OPCODE_REM_INT_LIT16:
-  case OPCODE_REM_INT_LIT8: {
+  case OPCODE_REM_INT_LIT: {
     if (lit != 0) {
       result = (*int_val) % lit;
     }
     use_result_reg = true;
     break;
   }
-  case OPCODE_AND_INT_LIT16:
-  case OPCODE_AND_INT_LIT8: {
+  case OPCODE_AND_INT_LIT: {
     result = (*int_val) & lit;
     break;
   }
-  case OPCODE_OR_INT_LIT16:
-  case OPCODE_OR_INT_LIT8: {
+  case OPCODE_OR_INT_LIT: {
     result = (*int_val) | lit;
     break;
   }
-  case OPCODE_XOR_INT_LIT16:
-  case OPCODE_XOR_INT_LIT8: {
+  case OPCODE_XOR_INT_LIT: {
     result = (*int_val) ^ lit;
     break;
   }
   // as in https://source.android.com/devices/tech/dalvik/dalvik-bytecode
   // the following operations have the second operand masked.
-  case OPCODE_SHL_INT_LIT8: {
+  case OPCODE_SHL_INT_LIT: {
     uint32_t ucst = *int_val;
     uint32_t uresult = ucst << (lit & 0x1f);
     result = (int32_t)uresult;
     break;
   }
-  case OPCODE_SHR_INT_LIT8: {
+  case OPCODE_SHR_INT_LIT: {
     result = (*int_val) >> (lit & 0x1f);
     break;
   }
-  case OPCODE_USHR_INT_LIT8: {
+  case OPCODE_USHR_INT_LIT: {
     uint32_t ucst = *int_val;
     // defined in dalvik spec
     result = ucst >> (lit & 0x1f);
@@ -320,15 +318,8 @@ bool RegisterTypeAnalyzer::analyze_new_instance(const IRInstruction* insn,
 
 bool RegisterTypeAnalyzer::analyze_new_array(const IRInstruction* insn,
                                              DexTypeEnvironment* env) {
-  auto length_opt = env->get(insn->src(0)).get_constant();
-  // If it's a primitive array or the length is missing, drop array elements
-  // nullness.
-  if (!type::is_reference_array(insn->get_type()) ||
-      !ArrayNullnessDomain::is_valid_array_size(length_opt)) {
-    env->set(RESULT_REGISTER, DexTypeDomain(insn->get_type()));
-  } else {
-    env->set(RESULT_REGISTER, DexTypeDomain(insn->get_type(), *length_opt));
-  }
+  // Skip array element nullness domains.
+  env->set(RESULT_REGISTER, DexTypeDomain(insn->get_type()));
   return true;
 }
 
@@ -348,14 +339,17 @@ bool RegisterTypeAnalyzer::analyze_invoke(const IRInstruction* insn,
   // Note we don't need to take care of the RESULT_REGISTER update from this
   // point. The remaining cases are already taken care by the
   // WholeProgramAwareAnalyzer::analyze_invoke.
-  if (!method->is_external() && !is_native(method)) {
-    return false;
-  }
-
-  // If an ArrayNullnessDomain is passed to an external or native call, it
-  // escape the analyzable domain. We have to rewrite all the nullness of its
-  // elements to top, since we don't know how it will be manipulated externally.
-  // Reference: T107422148
+  //
+  // When passed through a call, we need to reset the elements of an
+  // ArrayNullnessDomain. The domain passed to the callee is a copy and can be
+  // written over there. That means that the local ArrayNullnessDomain stored in
+  // the caller environment might be out of date.
+  //
+  // E.g., a newly allocated array in a caller environment has its elements
+  // initially as UNINITIALIED. The array elements can be updated by a callee
+  // which has access to the array. At that point, the updated element is no
+  // longer UNINITIALIED. However, the change is not propagated to the caller
+  // environment. Reference: T107422148, T123970364
   for (auto src : insn->srcs()) {
     auto type_domain = env->get(src);
     auto array_nullness = type_domain.get_array_nullness();

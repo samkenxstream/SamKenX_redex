@@ -15,11 +15,14 @@
 
 #include "GlobalConfig.h"
 #include "JsonWrapper.h"
-#include "ProguardMap.h"
 
 class DexMethodRef;
 class DexType;
 struct ProguardMap;
+
+constexpr const char* CLASS_SPLITTING_RELOCATED_SUFFIX = "$relocated";
+constexpr const size_t CLASS_SPLITTING_RELOCATED_SUFFIX_LEN = 10;
+constexpr const char* CLASS_SPLITTING_RELOCATED_SUFFIX_SEMI = "$relocated;";
 
 namespace Json {
 class Value;
@@ -83,16 +86,40 @@ struct ConfigFiles {
     return m_class_lists.at(name);
   }
 
-  const std::vector<std::string>& get_dead_class_list();
+  const std::unordered_map<std::string, int64_t>& get_dead_class_list();
+  const std::unordered_set<std::string>& get_live_class_split_list();
 
-  const method_profiles::MethodProfiles& get_method_profiles() {
+  void clear_dead_class_and_live_relocated_sets() {
+    m_dead_class_list_attempted = false;
+    m_dead_classes.clear();
+    m_live_relocated_classes.clear();
+  }
+
+  method_profiles::MethodProfiles& get_method_profiles() {
     ensure_agg_method_stats_loaded();
     return *m_method_profiles;
   }
 
+  const method_profiles::MethodProfiles& get_method_profiles() const {
+    ensure_agg_method_stats_loaded();
+    return *m_method_profiles;
+  }
+
+  method_profiles::MethodProfiles& get_secondary_method_profiles() {
+    ensure_secondary_method_stats_loaded();
+    return *m_secondary_method_profiles;
+  }
+
+  const method_profiles::MethodProfiles& get_secondary_method_profiles() const {
+    ensure_secondary_method_stats_loaded();
+    return *m_secondary_method_profiles;
+  }
+
   void process_unresolved_method_profile_lines();
+  void process_unresolved_secondary_method_profile_lines();
 
   const std::unordered_set<DexType*>& get_no_optimizations_annos();
+  const std::unordered_set<std::string>& get_no_optimizations_blocklist();
   const std::unordered_set<DexMethodRef*>& get_pure_methods();
   const std::unordered_set<const DexString*>& get_finalish_field_names();
   const std::unordered_set<DexType*>& get_do_not_devirt_anon();
@@ -164,18 +191,29 @@ struct ConfigFiles {
 
   std::vector<std::string> load_coldstart_classes();
   std::unordered_map<std::string, std::vector<std::string>> load_class_lists();
-  void ensure_agg_method_stats_loaded();
+  void ensure_agg_method_stats_loaded() const;
+  void ensure_secondary_method_stats_loaded() const;
   void load_inliner_config(inliner::InlinerConfig*);
+  void build_dead_class_and_live_class_split_lists();
+  bool is_relocated_class(std::string_view name) const;
+  void remove_relocated_part(std::string_view* name);
+
+  // For testing.
+  void set_class_lists(
+      std::unordered_map<std::string, std::vector<std::string>> l);
 
   bool m_load_class_lists_attempted{false};
   std::unique_ptr<ProguardMap> m_proguard_map;
   std::string m_coldstart_class_filename;
   std::vector<std::string> m_coldstart_classes;
   std::unordered_map<std::string, std::vector<std::string>> m_class_lists;
-  std::vector<std::string> m_dead_class_list;
   bool m_dead_class_list_attempted{false};
   std::string m_printseeds; // Filename to dump computed seeds.
-  std::unique_ptr<method_profiles::MethodProfiles> m_method_profiles;
+  mutable std::unique_ptr<method_profiles::MethodProfiles> m_method_profiles;
+  mutable std::unique_ptr<method_profiles::MethodProfiles>
+      m_secondary_method_profiles;
+  std::unordered_map<std::string, int64_t> m_dead_classes;
+  std::unordered_set<std::string> m_live_relocated_classes;
 
   // limits the output instruction size of any DexMethod to 2^n
   // 0 when limit is not present
@@ -184,6 +222,8 @@ struct ConfigFiles {
   std::unordered_set<DexType*> m_no_devirtualize_annos;
   // global no optimizations annotations
   std::unordered_set<DexType*> m_no_optimizations_annos;
+  // global no optimizations blocklist (type prefixes)
+  std::unordered_set<std::string> m_no_optimizations_blocklist;
   // global pure methods
   std::unordered_set<DexMethodRef*> m_pure_methods;
   // names of fields that behave similar to final fields, i.e. written once
@@ -194,4 +234,6 @@ struct ConfigFiles {
   // min_sdk AndroidAPI
   int32_t m_min_sdk_api_level = 0;
   std::unique_ptr<api::AndroidSDK> m_android_min_sdk_api;
+
+  friend struct ClassPreloadTest;
 };

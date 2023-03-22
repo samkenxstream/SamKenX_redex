@@ -27,7 +27,6 @@ namespace {
 // (how many times optimization runs) * (code units saved per run)
 #define TESTS                                           \
   WORK(test_Coalesce_InitVoid_AppendString, 3)          \
-  WORK(test_CompileTime_StringHashCode, 5 * 1)          \
   WORK(test_Remove_AppendEmptyString, 1 * 3)            \
   WORK(test_Coalesce_Init_AppendChar, 4)                \
   WORK(test_Coalesce_AppendString_AppendInt, 6 * 1)     \
@@ -64,14 +63,16 @@ struct PrePostVerify : testing::Test {
 
   PrePostVerify() {
     g_redex = new RedexContext;
-    DexClasses before_classes(
-        load_classes_from_dex(std::getenv("dex_pre"), /* balloon */ false));
+    DexClasses before_classes(load_classes_from_dex(
+        DexLocation::make_location("", std::getenv("dex_pre")),
+        /* balloon */ false));
     load_method_sizes(before_classes, before_sizes);
     delete g_redex;
 
     g_redex = new RedexContext;
-    DexClasses after_classes(
-        load_classes_from_dex(std::getenv("dex_post"), /* balloon */ false));
+    DexClasses after_classes(load_classes_from_dex(
+        DexLocation::make_location("", std::getenv("dex_post")),
+        /* balloon */ false));
     load_method_sizes(after_classes, after_sizes);
     delete g_redex;
 

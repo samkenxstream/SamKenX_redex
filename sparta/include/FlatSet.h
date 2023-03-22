@@ -119,7 +119,8 @@ class FlatSet final {
     return *this;
   }
 
-  FlatSet& filter(const std::function<bool(const Element&)>& predicate) {
+  template <typename Predicate> // bool(const Element&)
+  FlatSet& filter(Predicate&& predicate) {
     m_vector.erase(
         std::remove_if(m_vector.begin(), m_vector.end(),
                        [&](const Element& e) { return !predicate(e); }),
@@ -212,7 +213,7 @@ class FlatSet final {
   friend std::ostream& operator<<(std::ostream& o, const FlatSet<Element>& s) {
     o << "{";
     for (auto it = s.begin(), end = s.end(); it != end;) {
-      o << pt_util::Dereference<Element>()(*it);
+      o << pt_util::deref(*it);
       ++it;
       if (it != end) {
         o << ", ";

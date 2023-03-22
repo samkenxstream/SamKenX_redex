@@ -10,6 +10,7 @@
 #include "ControlFlow.h"
 #include "DexClass.h"
 #include "IROpcode.h"
+#include "WellKnownTypes.h"
 
 namespace method {
 /**
@@ -21,6 +22,11 @@ bool is_init(const DexMethodRef* method);
  * True if the method is a static constructor (matches the "<clinit>" name)
  */
 bool is_clinit(const DexMethodRef* method);
+
+/**
+ * True if the method is a constructor without arguments
+ */
+bool is_argless_init(const DexMethodRef* method);
 
 /**
  * Whether the method is a ctor or static ctor.
@@ -50,6 +56,7 @@ using ClInitHasNoSideEffectsPredicate = std::function<bool(const DexType*)>;
  */
 const DexClass* clinit_may_have_side_effects(
     const DexClass* cls,
+    bool allow_benign_method_invocations,
     const ClInitHasNoSideEffectsPredicate* clinit_has_no_side_effects = nullptr,
     const std::unordered_set<DexMethod*>* non_true_virtuals = nullptr);
 
@@ -105,19 +112,12 @@ inline bool signatures_match(const DexMethodRef* a, const DexMethodRef* b) {
   return a->get_name() == b->get_name() && a->get_proto() == b->get_proto();
 }
 
-DexMethod* java_lang_Object_ctor();
+#define DECLARE_METHOD(name, _) DexMethod* name();
 
-DexMethod* java_lang_Enum_ctor();
-
-DexMethod* java_lang_Enum_ordinal();
-
-DexMethod* java_lang_Enum_name();
-
-DexMethod* java_lang_Enum_equals();
-
-DexMethod* java_lang_Integer_valueOf();
-
-DexMethod* java_lang_Integer_intValue();
+#define FOR_EACH DECLARE_METHOD
+WELL_KNOWN_METHODS
+#undef FOR_EACH
+#undef DECLARE_METHOD
 
 DexMethod* kotlin_jvm_internal_Intrinsics_checkParameterIsNotNull();
 

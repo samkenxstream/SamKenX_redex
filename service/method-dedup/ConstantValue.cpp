@@ -42,7 +42,7 @@ ConstantValue::ConstantValue(const TypeTags* type_tags,
     m_kind = ConstantKind::INT;
     m_int_val = std::stoll(val_str);
   } else if (kind_str == "T") {
-    auto type_val = DexType::get_type(val_str.c_str());
+    auto type_val = DexType::get_type(val_str);
     if (type_val != nullptr && type_tags->has_type_tag(type_val)) {
       m_kind = ConstantKind::TYPE;
       m_int_val = type_tags->get_type_tag(type_val);
@@ -224,7 +224,7 @@ DexMethod* ConstantValues::create_stub_method(DexMethod* callee) {
   // Assuming that callee's proto is already modified by appending the lifted
   // params.
   auto appended_proto = callee->get_proto();
-  auto stub_arg_list = appended_proto->get_args()->pop_front(size());
+  auto stub_arg_list = appended_proto->get_args()->pop_back(size());
   auto stub_proto =
       DexProto::make_proto(appended_proto->get_rtype(), stub_arg_list);
   auto name = DexString::make_string(callee->get_name()->str() + "$stub");
@@ -272,7 +272,7 @@ DexMethod* ConstantValues::create_stub_method(DexMethod* callee) {
 
   auto stub = mc->create();
   // Propogate deobfuscated name
-  auto orig_name = callee->get_deobfuscated_name_or_empty();
+  const auto orig_name = callee->get_deobfuscated_name_or_empty();
   auto pos = orig_name.find(':');
   always_assert(pos != std::string::npos);
   auto new_name =

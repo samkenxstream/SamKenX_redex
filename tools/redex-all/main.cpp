@@ -5,13 +5,13 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#include <boost/format.hpp>
 #include <boost/thread/thread.hpp>
 #include <cinttypes>
 #include <cstring>
 #include <ctime>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <memory>
 #include <regex>
 #include <set>
@@ -35,7 +35,6 @@
 #include <boost/program_options.hpp>
 #include <json/json.h>
 
-#include "ABExperimentContext.h"
 #include "AggregateException.h"
 #include "CommandProfiling.h"
 #include "CommentFilter.h"
@@ -49,7 +48,6 @@
 #include "DuplicateClasses.h"
 #include "GlobalConfig.h"
 #include "IODIMetadata.h"
-#include "IOUtil.h"
 #include "InstructionLowering.h"
 #include "JarLoader.h"
 #include "JemallocUtil.h"
@@ -64,11 +62,12 @@
 #include "ProguardMatcher.h"
 #include "ProguardParser.h" // New ProGuard Parser
 #include "ProguardPrintConfiguration.h" // New ProGuard configuration
-#include "Purity.h" // For defaults from config.
 #include "ReachableClasses.h"
 #include "RedexContext.h"
 #include "RedexResources.h"
+#include "Sanitizers.h"
 #include "SanitizersConfig.h"
+#include "ScopedMemStats.h"
 #include "Show.h"
 #include "Timer.h"
 #include "ToolsCommon.h"
@@ -84,7 +83,6 @@ constexpr const char* DEBUG_LINE_MAP = "redex-debug-line-map-v2";
 constexpr const char* IODI_METADATA = "iodi-metadata";
 constexpr const char* OPT_DECISIONS = "redex-opt-decisions.json";
 constexpr const char* CLASS_METHOD_INFO_MAP = "redex-class-method-info-map.txt";
-constexpr const char* RESID_TO_NAME = "resid_to_name.json";
 
 const std::string k_usage_header = "usage: redex-all [options...] dex-files...";
 
@@ -176,11 +174,10 @@ bool add_value_to_config(Json::Value& config,
 
 Json::Value default_config() {
   const auto passes = {
-      "ReBindRefsPass",        "BridgePass",
-      "FinalInlinePassV2",     "DelSuperPass",
-      "SingleImplPass",        "MethodInlinePass",
-      "StaticReloPassV2",      "RemoveEmptyClassesPass",
-      "ShortenSrcStringsPass", "RegAllocPass",
+      "ReBindRefsPass",   "BridgeSynthInlinePass",  "FinalInlinePassV2",
+      "DelSuperPass",     "SingleImplPass",         "MethodInlinePass",
+      "StaticReloPassV2", "RemoveEmptyClassesPass", "ShortenSrcStringsPass",
+      "RegAllocPass",
   };
   std::istringstream temp_json("{\"redex\":{\"passes\":[]}}");
   Json::Value cfg;
@@ -685,7 +682,8 @@ Json::Value get_position_stats(const PositionMapper* pos_mapper) {
   return obj;
 }
 
-Json::Value get_detailed_stats(const std::vector<dex_stats_t>& dexes_stats) {
+template <typename StatsT>
+Json::Value get_detailed_stats(const std::vector<StatsT>& dexes_stats) {
   Json::Value dexes;
   int i = 0;
   for (const dex_stats_t& stats : dexes_stats) {
@@ -719,7 +717,7 @@ Json::Value get_input_stats(const dex_stats_t& stats,
 
 Json::Value get_output_stats(
     const dex_stats_t& stats,
-    const std::vector<dex_stats_t>& dexes_stats,
+    const std::vector<enhanced_dex_stats_t>& dexes_stats,
     const PassManager& mgr,
     const instruction_lowering::Stats& instruction_lowering_stats,
     const PositionMapper* pos_mapper) {
@@ -819,7 +817,8 @@ std::string get_dex_magic(std::vector<std::string>& dex_files) {
   always_assert_log(!dex_files.empty(), "APK contains no dex file\n");
   // Get dex magic from the first dex file since all dex magic
   // should be consistent within one APK.
-  return load_dex_magic_from_dex(dex_files[0].c_str());
+  return load_dex_magic_from_dex(
+      DexLocation::make_location("dex", dex_files[0]));
 }
 
 void dump_keep_reasons(const ConfigFiles& conf,
@@ -875,6 +874,45 @@ void dump_keep_reasons(const ConfigFiles& conf,
   }
 }
 
+void process_proguard_rules(ConfigFiles& conf,
+                            Scope& scope,
+                            Scope& external_classes,
+                            keep_rules::ProguardConfiguration& pg_config) {
+  bool keep_all_annotation_classes;
+  conf.get_json_config().get("keep_all_annotation_classes", true,
+                             keep_all_annotation_classes);
+
+  ConcurrentSet<const keep_rules::KeepSpec*> unused_rules =
+      process_proguard_rules(conf.get_proguard_map(), scope, external_classes,
+                             pg_config, keep_all_annotation_classes);
+  if (!unused_rules.empty()) {
+    std::vector<std::string> out;
+    for (const keep_rules::KeepSpec* keep_rule : unused_rules) {
+      out.push_back(keep_rules::show_keep(*keep_rule));
+    }
+    // Make output deterministic
+    std::sort(out.begin(), out.end());
+    bool unused_rule_abort;
+    conf.get_json_config().get("unused_keep_rule_abort", false,
+                               unused_rule_abort);
+    always_assert_log(!unused_rule_abort, "%s",
+                      [&]() {
+                        std::string tmp;
+                        for (const auto& s : out) {
+                          tmp += s;
+                          tmp += " not used\n";
+                        }
+                        return tmp;
+                      }()
+                          .c_str());
+
+    std::ofstream ofs{conf.metafile("redex-unused-keep-rules.txt")};
+    for (const auto& s : out) {
+      ofs << s << "\n";
+    }
+  }
+}
+
 /**
  * Pre processing steps: load dex and configurations
  */
@@ -912,6 +950,24 @@ void redex_frontend(ConfigFiles& conf, /* input */
           keep_rules::proguard_parser::remove_default_blocklisted_rules(
               &pg_config);
     }
+
+    always_assert(!pg_conf.fail_on_unknown_commands ||
+                  parser_stats.unknown_commands == 0);
+  }
+
+  // WARNING: No further modifications of pg_config should happen after this
+  // call
+  // TODO: T148153725: [redex] Better encapsulate ProguardConfiguration
+  // construction
+  keep_rules::proguard_parser::identify_blanket_native_rules(&pg_config);
+
+  auto ignore_no_keep_rules =
+      args.config.get("ignore_no_keep_rules", false).asBool();
+  if (pg_config.keep_rules.empty() && !ignore_no_keep_rules) {
+    std::cerr << "error: No ProGuard keep rules provided. Redex optimizations "
+                 "will not preserve semantics without accurate keep rules."
+              << std::endl;
+    exit(EXIT_FAILURE);
   }
 
   {
@@ -920,8 +976,12 @@ void redex_frontend(ConfigFiles& conf, /* input */
     d["parse_errors"] = (u64)parser_stats.parse_errors;
     d["unknown_tokens"] = (u64)parser_stats.unknown_tokens;
     d["unimplemented"] = (u64)parser_stats.unimplemented;
+    d["unknown_commands"] = (u64)parser_stats.unknown_commands;
     d["ok"] = (u64)(pg_config.ok ? 1 : 0);
     d["blocklisted_rules"] = (u64)blocklisted_rules;
+    d["blanket_native_rules"] = (u64)(std::distance(
+        pg_config.keep_rules_native_begin.value_or(pg_config.keep_rules.end()),
+        pg_config.keep_rules.end()));
     stats["proguard"] = d;
   }
 
@@ -972,10 +1032,11 @@ void redex_frontend(ConfigFiles& conf, /* input */
 
     for (const auto& library_jar : library_jars) {
       TRACE(MAIN, 1, "LIBRARY JAR: %s", library_jar.c_str());
-      if (!load_jar_file(library_jar.c_str(), &external_classes)) {
+      if (!load_jar_file(DexLocation::make_location("", library_jar),
+                         &external_classes)) {
         // Try again with the basedir
         std::string basedir_path = pg_config.basedirectory + "/" + library_jar;
-        if (!load_jar_file(basedir_path.c_str())) {
+        if (!load_jar_file(DexLocation::make_location("", basedir_path))) {
           std::cerr << "error: library jar could not be loaded: " << library_jar
                     << std::endl;
           exit(EXIT_FAILURE);
@@ -997,71 +1058,53 @@ void redex_frontend(ConfigFiles& conf, /* input */
   DexStoreClassesIterator it(stores);
   Scope scope = build_class_scope(it);
   {
-    Timer t("Processing proguard rules");
-
-    bool keep_all_annotation_classes;
-    json_config.get("keep_all_annotation_classes", true,
-                    keep_all_annotation_classes);
-
-    ConcurrentSet<const keep_rules::KeepSpec*> unused_rules =
-        process_proguard_rules(conf.get_proguard_map(), scope, external_classes,
-                               pg_config, keep_all_annotation_classes);
-    if (unused_rules.size() > 0) {
-      std::vector<std::string> out;
-      for (const keep_rules::KeepSpec* keep_rule : unused_rules) {
-        out.push_back(keep_rules::show_keep(*keep_rule));
-      }
-      // Make output deterministic
-      std::sort(out.begin(), out.end());
-      bool unused_rule_abort;
-      conf.get_json_config().get("unused_keep_rule_abort", false,
-                                 unused_rule_abort);
-      if (unused_rule_abort) {
-        exit(1);
-        for (const auto& s : out) {
-          fprintf(stderr, "%s not used\n", s.c_str());
-        }
-      }
-      auto fd =
-          fopen(conf.metafile("redex-unused-keep-rules.txt").c_str(), "w");
-      for (const auto& s : out) {
-        fprintf(fd, "%s\n", s.c_str());
-      }
-      fclose(fd);
-    }
-  }
-  {
     Timer t("No Optimizations Rules");
     // this will change rstate of methods
     keep_rules::process_no_optimizations_rules(
-        conf.get_no_optimizations_annos(), scope);
+        conf.get_no_optimizations_annos(),
+        conf.get_no_optimizations_blocklist(), scope);
   }
   {
     Timer t("Initializing reachable classes");
     // init reachable will change rstate of classes, methods and fields
     init_reachable_classes(scope, ReachableClassesConfig(json_config));
   }
+  {
+    Timer t("Processing proguard rules");
+    process_proguard_rules(conf, scope, external_classes, pg_config);
+  }
+
+  TRACE(NATIVE, 2, "Blanket native classes: %zu",
+        g_redex->blanket_native_root_classes.size());
+  TRACE(NATIVE, 2, "Blanket native methods: %zu",
+        g_redex->blanket_native_root_methods.size());
 
   if (keep_reason::Reason::record_keep_reasons()) {
     dump_keep_reasons(conf, args, stores);
   }
 }
 
-void write_out_resid_to_name(ConfigFiles& conf) {
-  std::string apk_dir;
-  conf.get_json_config().get("apk_dir", "", apk_dir);
-  if (!apk_dir.size()) {
+// Performa check for resources that must exist for app to behave correctly,
+// crash the build if they fail to present.
+void check_required_resources(ConfigFiles& conf, bool pre_run) {
+  std::vector<std::string> check_required_resources;
+  conf.get_json_config().get("check_required_resources", {},
+                             check_required_resources);
+  if (check_required_resources.empty()) {
     return;
   }
+
+  std::string apk_dir;
+  conf.get_json_config().get("apk_dir", "", apk_dir);
+  TRACE(MAIN, 1, "Validating resources.");
   auto resources = create_resource_reader(apk_dir);
   auto res_table = resources->load_res_table();
-  Json::Value resid_to_name_json;
-  boost::format hex_format("0x%08x");
-  for (const auto& pair : res_table->id_to_name) {
-    resid_to_name_json[(hex_format % pair.first).str()] = pair.second;
+  for (const auto& required_resource : check_required_resources) {
+    always_assert_log(res_table->name_to_ids.count(required_resource) != 0,
+                      "Required resource %s does not exist in %s apk",
+                      required_resource.c_str(),
+                      pre_run ? "input" : "final");
   }
-  write_string_to_file(conf.metafile(RESID_TO_NAME),
-                       resid_to_name_json.toStyledString());
 }
 
 // Performa final wave of cleanup (i.e. garbage collect unreferenced strings,
@@ -1071,6 +1114,11 @@ void finalize_resource_table(ConfigFiles& conf) {
   if (!conf.finalize_resource_table()) {
     return;
   }
+  const auto& json = conf.get_json_config();
+  if (json.get("after_pass_size", false)) {
+    return;
+  }
+
   std::string apk_dir;
   conf.get_json_config().get("apk_dir", "", apk_dir);
   if (apk_dir.empty()) {
@@ -1079,7 +1127,9 @@ void finalize_resource_table(ConfigFiles& conf) {
   TRACE(MAIN, 1, "Finalizing resource table.");
   auto resources = create_resource_reader(apk_dir);
   auto res_table = resources->load_res_table();
-  res_table->remove_unreferenced_strings();
+  auto global_resources_config =
+      conf.get_global_config().get_config_by_name<ResourceConfig>("resources");
+  res_table->finalize_resource_table(*global_resources_config);
 }
 
 /**
@@ -1093,8 +1143,8 @@ void redex_backend(ConfigFiles& conf,
   const RedexOptions& redex_options = manager.get_redex_options();
   const auto& output_dir = conf.get_outdir();
 
-  write_out_resid_to_name(conf);
   finalize_resource_table(conf);
+  check_required_resources(conf, false);
 
   instruction_lowering::Stats instruction_lowering_stats;
   {
@@ -1104,6 +1154,8 @@ void redex_backend(ConfigFiles& conf,
     instruction_lowering_stats =
         instruction_lowering::run(stores, lower_with_cfg);
   }
+
+  sanitizers::lsan_do_recoverable_leak_check();
 
   TRACE(MAIN, 1, "Writing out new DexClasses...");
   const JsonWrapper& json_config = conf.get_json_config();
@@ -1115,11 +1167,8 @@ void redex_backend(ConfigFiles& conf,
     locator_index = new LocatorIndex(make_locator_index(stores));
   }
 
-  auto disable_method_similarity_order =
-      json_config.get("disable_method_similarity_order", false);
-
-  dex_stats_t output_totals;
-  std::vector<dex_stats_t> output_dexes_stats;
+  enhanced_dex_stats_t output_totals;
+  std::vector<enhanced_dex_stats_t> output_dexes_stats;
 
   const std::string& line_number_map_filename = conf.metafile(LINE_NUMBER_MAP);
   const std::string& debug_line_map_filename = conf.metafile(DEBUG_LINE_MAP);
@@ -1153,45 +1202,68 @@ void redex_backend(ConfigFiles& conf,
     post_lowering->sync();
   }
 
+  const bool mem_stats_enabled =
+      traceEnabled(STATS, 1) || conf.get_json_config().get("mem_stats", true);
+  const bool reset_hwm = conf.get_json_config().get("mem_stats_per_pass", true);
+
   if (is_iodi(dik)) {
     Timer t("Compute initial IODI metadata");
-    iodi_metadata.mark_methods(stores);
+    ScopedMemStats iodi_mem_stats{mem_stats_enabled, reset_hwm};
+    iodi_metadata.mark_methods(stores,
+                               dik == DebugInfoKind::InstructionOffsetsLayered);
+    iodi_mem_stats.trace_log("Compute initial IODI metadata");
   }
-  for (size_t store_number = 0; store_number < stores.size(); ++store_number) {
-    auto& store = stores[store_number];
-    Timer t("Writing optimized dexes");
-    for (size_t i = 0; i < store.get_dexen().size(); i++) {
-      auto gtypes = std::make_shared<GatheredTypes>(&store.get_dexen()[i]);
 
-      if (post_lowering) {
-        post_lowering->load_dex_indexes(
-            conf, manager.get_redex_options().min_sdk, &store.get_dexen()[i],
-            *gtypes, store.get_name(), i);
+  const auto& dex_output_config =
+      *conf.get_global_config().get_config_by_name<DexOutputConfig>(
+          "dex_output");
+
+  {
+    ScopedMemStats wod_mem_stats{mem_stats_enabled, reset_hwm};
+    for (size_t store_number = 0; store_number < stores.size();
+         ++store_number) {
+      auto& store = stores[store_number];
+      Timer t("Writing optimized dexes");
+      for (size_t i = 0; i < store.get_dexen().size(); i++) {
+        auto gtypes = std::make_shared<GatheredTypes>(&store.get_dexen()[i]);
+
+        if (post_lowering) {
+          post_lowering->load_dex_indexes(
+              conf, manager.get_redex_options().min_sdk, &store.get_dexen()[i],
+              *gtypes, store.get_name(), i);
+        }
+
+        auto this_dex_stats = write_classes_to_dex(
+            redex::get_dex_output_name(output_dir, store, i),
+            &store.get_dexen()[i],
+            gtypes,
+            locator_index,
+            store_number,
+            &store.get_name(),
+            i,
+            conf,
+            pos_mapper.get(),
+            redex_options.debug_info_kind,
+            needs_addresses ? &method_to_id : nullptr,
+            needs_addresses ? &code_debug_lines : nullptr,
+            is_iodi(dik) ? &iodi_metadata : nullptr,
+            stores[0].get_dex_magic(),
+            dex_output_config,
+            symbolicate_detached_methods ? post_lowering.get() : nullptr,
+            manager.get_redex_options().min_sdk);
+
+        output_totals += this_dex_stats;
+        // Remove class sizes here to free up memory.
+        this_dex_stats.class_size.clear();
+        output_dexes_stats.push_back(this_dex_stats);
+        signatures.insert(
+            *reinterpret_cast<uint32_t*>(this_dex_stats.signature));
       }
-
-      auto this_dex_stats = write_classes_to_dex(
-          redex_options,
-          redex::get_dex_output_name(output_dir, store, i),
-          &store.get_dexen()[i],
-          gtypes,
-          locator_index,
-          store_number,
-          i,
-          conf,
-          pos_mapper.get(),
-          needs_addresses ? &method_to_id : nullptr,
-          needs_addresses ? &code_debug_lines : nullptr,
-          is_iodi(dik) ? &iodi_metadata : nullptr,
-          stores[0].get_dex_magic(),
-          symbolicate_detached_methods ? post_lowering.get() : nullptr,
-          manager.get_redex_options().min_sdk,
-          disable_method_similarity_order);
-
-      output_totals += this_dex_stats;
-      output_dexes_stats.push_back(this_dex_stats);
-      signatures.insert(*reinterpret_cast<uint32_t*>(this_dex_stats.signature));
     }
+    wod_mem_stats.trace_log("Writing optimized dexes");
   }
+
+  sanitizers::lsan_do_recoverable_leak_check();
 
   std::vector<DexMethod*> needs_debug_line_mapping;
   if (post_lowering) {
@@ -1239,6 +1311,21 @@ void redex_backend(ConfigFiles& conf,
         get_output_stats(output_totals, output_dexes_stats, manager,
                          instruction_lowering_stats, pos_mapper.get());
     print_warning_summary();
+
+    if (dex_output_config.write_class_sizes) {
+      Timer t2("Writing class sizes");
+      // Sort for stability.
+      std::vector<const DexClass*> keys;
+      std::transform(output_totals.class_size.begin(),
+                     output_totals.class_size.end(), std::back_inserter(keys),
+                     [](const auto& p) { return p.first; });
+      std::sort(keys.begin(), keys.end(), compare_dexclasses);
+      std::ofstream ofs{conf.metafile("redex-class-sizes.csv")};
+      for (auto* c : keys) {
+        ofs << c->get_deobfuscated_name_or_empty() << ","
+            << output_totals.class_size.at(c) << "\n";
+      }
+    }
   }
 }
 
@@ -1284,7 +1371,7 @@ void dump_class_method_info_map(const std::string& file_path,
   std::unordered_map<std::string /*location*/, int /*index*/> dexloc_map;
 
   walk::classes(build_class_scope(stores), [&](const DexClass* cls) {
-    const auto& dexloc = cls->get_location();
+    const auto& dexloc = cls->get_location()->get_file_name();
     if (!dexloc_map.count(dexloc)) {
       dexloc_map[dexloc] = dexloc_map.size();
       ofs << "I,DEXLOC," << dexloc_map[dexloc] << "," << dexloc << std::endl;
@@ -1348,6 +1435,7 @@ void copy_proguard_stats(Json::Value& stats) {
 
 } // namespace
 
+// NOLINTNEXTLINE(bugprone-exception-escape)
 int main(int argc, char* argv[]) {
   signal(SIGABRT, debug_backtrace_handler);
   signal(SIGINT, debug_backtrace_handler);
@@ -1361,8 +1449,17 @@ int main(int argc, char* argv[]) {
   // For better stacks in abort dumps.
   set_abort_if_not_this_thread();
 
+  // For Breadcrumbs issues, do not throw, do not print stack trace. Improves
+  // error readability.
+  redex_debug::set_exc_type_as_abort(RedexError::REJECTED_CODING_PATTERN);
+  redex_debug::disable_stack_trace_for_exc_type(
+      RedexError::REJECTED_CODING_PATTERN);
+
   auto maybe_global_profile =
       ScopedCommandProfiling::maybe_from_env("GLOBAL_", "global");
+
+  ConcurrentContainerConcurrentDestructionScope
+      concurrent_container_destruction_scope;
 
   std::string stats_output_path;
   Json::Value stats;
@@ -1389,6 +1486,27 @@ int main(int argc, char* argv[]) {
 
     // For convenience.
     g_redex->instrument_mode = args.redex_options.instrument_pass_enabled;
+    if (g_redex->instrument_mode) {
+      IRList::CONSECUTIVE_STYLE = IRList::ConsecutiveStyle::kChain;
+    }
+    {
+      auto consecutive_val =
+          args.config.get("sb_consecutive_style", Json::nullValue);
+      if (consecutive_val.isString()) {
+        auto str = consecutive_val.asString();
+        IRList::CONSECUTIVE_STYLE = [&]() {
+          if (str == "drop") {
+            return IRList::ConsecutiveStyle::kDrop;
+          } else if (str == "chain") {
+            return IRList::ConsecutiveStyle::kChain;
+          } else if (str == "max") {
+            return IRList::ConsecutiveStyle::kMax;
+          } else {
+            not_reached_log("Unknown sb_consecutive_style %s", str.c_str());
+          }
+        }();
+      }
+    }
 
     slow_invariants_debug =
         args.config.get("slow_invariants_debug", false).asBool();
@@ -1419,15 +1537,10 @@ int main(int argc, char* argv[]) {
       maybe_dump_jemalloc_profile("MALLOC_PROFILE_DUMP_FRONTEND");
     }
 
-    // Initialize purity defaults, if set.
-    purity::CacheConfig::parse_default(conf);
+    check_required_resources(conf, true);
 
     auto const& passes = PassRegistry::get().get_passes();
-    PassManager manager(passes, std::move(pg_config), args.config,
-                        args.redex_options);
-
-    ab_test::ABExperimentContext::parse_experiments_states(
-        conf, !manager.get_redex_options().redacted);
+    PassManager manager(passes, std::move(pg_config), conf, args.redex_options);
 
     {
       Timer t("Running optimization passes");
@@ -1469,6 +1582,7 @@ int main(int argc, char* argv[]) {
 
   stats["output_stats"]["threads"] = get_threads_stats();
 
+  stats["output_stats"]["build_cfg_counter"] = (Json::UInt64)build_cfg_counter;
   // For the time being, copy proguard stats, if any, to the first pass.
   copy_proguard_stats(stats);
 

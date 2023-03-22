@@ -16,6 +16,8 @@ void InlinerConfig::bind_config() {
        enforce_method_size_limit);
   bind("throws", throws_inline, throws_inline);
   bind("throw_after_no_return", throw_after_no_return, throw_after_no_return);
+  bind("max_cost_for_constant_propagation", max_cost_for_constant_propagation,
+       max_cost_for_constant_propagation);
   bind("multiple_callers", multiple_callers, multiple_callers);
   bind("run_const_prop", shrinker.run_const_prop, shrinker.run_const_prop);
   bind("run_cse", shrinker.run_cse, shrinker.run_cse);
@@ -53,6 +55,7 @@ void IRTypeCheckerConfig::bind_config() {
   bind("check_num_of_refs", {}, check_num_of_refs);
   bind("annotated_cfg_on_error", annotated_cfg_on_error,
        annotated_cfg_on_error);
+  bind("check_classes", {}, check_classes);
 }
 
 void HasherConfig::bind_config() {
@@ -63,6 +66,7 @@ void AssessorConfig::bind_config() {
   bind("run_after_each_pass", run_after_each_pass, run_after_each_pass);
   bind("run_initially", run_initially, run_initially);
   bind("run_finally", run_finally, run_finally);
+  bind("run_sb_consistency", run_sb_consistency, run_sb_consistency);
 }
 
 void CheckUniqueDeobfuscatedNamesConfig::bind_config() {
@@ -75,16 +79,41 @@ void MethodProfileOrderingConfig::bind_config() {
   bind("method_sorting_allowlisted_substrings",
        method_sorting_allowlisted_substrings,
        method_sorting_allowlisted_substrings);
-  bind("legacy_profiled_code_item_sort_order", legacy_order, legacy_order);
   bind("min_appear_percent", min_appear_percent, min_appear_percent);
   bind("second_min_appear_percent", second_min_appear_percent,
        second_min_appear_percent);
+  bind("skip_similarity_reordering", skip_similarity_reordering,
+       skip_similarity_reordering);
+}
+
+void MethodSimilarityOrderingConfig::bind_config() {
+  bind("use_class_level_perf_sensitivity", use_class_level_perf_sensitivity,
+       use_class_level_perf_sensitivity);
+  bind("disable", disable, disable);
 }
 
 void ProguardConfig::bind_config() {
   bind("blocklist", blocklist, blocklist);
   bind("disable_default_blocklist", disable_default_blocklist,
        disable_default_blocklist);
+  bind("fail_on_unknown_commands", fail_on_unknown_commands,
+       fail_on_unknown_commands);
+}
+
+void PassManagerConfig::bind_config() {
+  bind("pass_aliases", pass_aliases, pass_aliases);
+  bind("jemalloc_full_stats", jemalloc_full_stats, jemalloc_full_stats);
+  bind("violations_tracking", violations_tracking, violations_tracking);
+}
+
+void ResourceConfig::bind_config() {
+  bind("customized_r_classes", {}, customized_r_classes);
+  bind("canonical_entry_types", {}, canonical_entry_types);
+  bind("sort_key_strings", false, sort_key_strings);
+}
+
+void DexOutputConfig::bind_config() {
+  bind("write_class_sizes", write_class_sizes, write_class_sizes);
 }
 
 void GlobalConfig::bind_config() {
@@ -134,9 +163,7 @@ void GlobalConfig::bind_config() {
   bind("legacy_reflection_reachability", false, bool_param);
   bind("lower_with_cfg", {}, bool_param);
   bind("no_optimizations_annotations", {}, string_vector_param);
-  // TODO: Remove unused profiled_methods_file option and all build system
-  // references
-  bind("profiled_methods_file", "", string_param);
+  bind("no_optimizations_blocklist", {}, string_vector_param);
   bind("proguard_map", "", string_param);
   bind("prune_unexported_components", {}, string_vector_param);
   bind("pure_methods", {}, string_vector_param);
@@ -152,6 +179,7 @@ void GlobalConfig::bind_config() {
   bind("no_devirtualize_annos", {}, string_vector_param);
   bind("create_init_class_insns", true, bool_param);
   bind("finalize_resource_table", false, bool_param);
+  bind("check_required_resources", {}, string_vector_param);
 
   for (const auto& entry : m_registry) {
     m_global_configs.emplace(entry.name,
@@ -173,7 +201,11 @@ GlobalConfigRegistry& GlobalConfig::default_registry() {
           "check_unique_deobfuscated_names"),
       register_as<OptDecisionsConfig>("opt_decisions"),
       register_as<MethodProfileOrderingConfig>("method_profile_order"),
+      register_as<MethodSimilarityOrderingConfig>("method_similarity_order"),
       register_as<ProguardConfig>("proguard"),
+      register_as<PassManagerConfig>("pass_manager"),
+      register_as<ResourceConfig>("resources"),
+      register_as<DexOutputConfig>("dex_output"),
   };
   return registry;
 }

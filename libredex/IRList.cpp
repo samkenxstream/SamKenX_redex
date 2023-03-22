@@ -945,7 +945,8 @@ std::string SourceBlock::show(bool quoted_src) const {
     }
     o << "@" << cur->id;
     o << "(";
-    for (const auto& val : cur->vals) {
+    for (size_t i = 0; i != cur->vals_size; ++i) {
+      auto& val = cur->vals[i];
       if (val) {
         o << val->val << ":" << val->appear100;
       } else {
@@ -956,4 +957,40 @@ std::string SourceBlock::show(bool quoted_src) const {
     o << ")";
   }
   return o.str();
+}
+
+IRList::ConsecutiveStyle IRList::CONSECUTIVE_STYLE =
+    IRList::ConsecutiveStyle::kMax;
+
+void IRList::chain_consecutive_source_blocks(ConsecutiveStyle style) {
+  boost::optional<IRList::iterator> last_it = boost::none;
+  for (auto it = begin(); it != end(); ++it) {
+    if (it->type == MFLOW_POSITION || it->type == MFLOW_DEBUG) {
+      // We can move over debug info. Otherwise, reset.
+      continue;
+    }
+    if (it->type != MFLOW_SOURCE_BLOCK) {
+      last_it = boost::none;
+      continue;
+    }
+
+    if (last_it) {
+      switch (style) {
+      case ConsecutiveStyle::kChain:
+        (*last_it)->src_block->append(std::move(it->src_block));
+        break;
+      case ConsecutiveStyle::kDrop:
+        break;
+      case ConsecutiveStyle::kMax:
+        (*last_it)->src_block->max(*it->src_block);
+        break;
+      }
+
+      auto prev = std::prev(it);
+      erase_and_dispose(it);
+      it = prev;
+    } else {
+      last_it = it;
+    }
+  }
 }

@@ -7,6 +7,7 @@
 
 #include <boost/filesystem.hpp>
 #include <gtest/gtest.h>
+#include <unordered_set>
 
 #include "BundleResources.h"
 #include "Debug.h"
@@ -14,16 +15,11 @@
 #include "RedexResources.h"
 #include "RedexTestUtils.h"
 #include "Trace.h"
+#include "androidfw/ResourceTypes.h"
 
 using namespace boost::filesystem;
 
 namespace {
-
-void copy_file(const std::string& from, const std::string& to) {
-  std::ifstream src_stream(from, std::ios::binary);
-  std::ofstream dest_stream(to, std::ios::binary);
-  dest_stream << src_stream.rdbuf();
-}
 
 void setup_resources_and_run(
     const std::function<void(const std::string& extract_dir, BundleResources*)>&
@@ -33,17 +29,18 @@ void setup_resources_and_run(
 
   auto res_dir = p / "base";
   create_directories(res_dir);
-  copy_file(std::getenv("test_res_path"), res_dir.string() + "/resources.pb");
+  redex::copy_file(std::getenv("test_res_path"),
+                   res_dir.string() + "/resources.pb");
 
   auto manifest_dir = p / "base/manifest";
   create_directories(manifest_dir);
-  copy_file(std::getenv("test_manifest_path"),
-            manifest_dir.string() + "/AndroidManifest.xml");
+  redex::copy_file(std::getenv("test_manifest_path"),
+                   manifest_dir.string() + "/AndroidManifest.xml");
 
   auto layout_dir = p / "base/res/layout";
   create_directories(layout_dir);
   auto layout_dest = layout_dir.string() + "/activity_main.xml";
-  copy_file(std::getenv("test_layout_path"), layout_dest);
+  redex::copy_file(std::getenv("test_layout_path"), layout_dest);
 
   BundleResources resources(tmp_dir.path);
   callback(tmp_dir.path, &resources);
@@ -60,11 +57,14 @@ ComponentTagInfo find_component_info(const std::vector<ComponentTagInfo>& list,
 }
 } // namespace
 
-TEST(BundleResources, TestReadMinSdk) {
+TEST(BundleResources, TestReadManifest) {
   setup_resources_and_run(
       [&](const std::string& extract_dir, BundleResources* resources) {
         auto result = resources->get_min_sdk();
         EXPECT_EQ(*result, 21);
+
+        auto package_name = resources->get_manifest_package_name();
+        EXPECT_STREQ(package_name->c_str(), "com.fb.bundles");
       });
 }
 
@@ -237,7 +237,8 @@ TEST(BundleResources, ReadResource) {
     EXPECT_EQ(bg_grey.size(), 1);
     obtain_resource_name_back = id_to_name.at(bg_grey[0]);
     EXPECT_EQ(obtain_resource_name_back, "bg_grey");
-    auto drawable_type_id = res_table->get_types_by_name({"drawable"});
+    std::unordered_set<std::string> types = {"drawable"};
+    auto drawable_type_id = res_table->get_types_by_name(types);
     EXPECT_EQ(drawable_type_id.size(), 1);
     std::unordered_set<std::string> drawable_res_names;
     for (const auto& pair : id_to_name) {
@@ -429,4 +430,122 @@ TEST(BundleResources, ChangeResourceIdInLayout) {
         kept_to_remapped_ids);
     EXPECT_EQ(changed, 4);
   });
+}
+
+TEST(BundleResources, ObfuscateResourcesName) {
+  setup_resources_and_run([&](const std::string& /* unused */,
+                              BundleResources* resources) {
+    auto res_table = resources->load_res_table();
+    auto color1_ids = res_table->get_res_ids_by_name("bg_grey");
+    EXPECT_EQ(color1_ids.size(), 1);
+    auto color1_id = color1_ids[0];
+    auto color2_ids = res_table->get_res_ids_by_name("keep_me_unused_color");
+    EXPECT_EQ(color2_ids.size(), 1);
+    auto color2_id = color2_ids[0];
+    auto color3_ids = res_table->get_res_ids_by_name("prickly_green");
+    EXPECT_EQ(color3_ids.size(), 1);
+    auto color3_id = color3_ids[0];
+    auto hex_or_file2_ids = res_table->get_res_ids_by_name("hex_or_file2");
+    EXPECT_EQ(hex_or_file2_ids.size(), 1);
+    auto hex_or_file2_id = hex_or_file2_ids[0];
+    auto hex_or_file_ids = res_table->get_res_ids_by_name("hex_or_file");
+    EXPECT_EQ(hex_or_file_ids.size(), 1);
+    auto hex_or_file_id = hex_or_file_ids[0];
+    auto duplicate_name_ids = res_table->get_res_ids_by_name("duplicate_name");
+    EXPECT_EQ(duplicate_name_ids.size(), 3);
+    auto dimen1_ids = res_table->get_res_ids_by_name("unused_dimen_2");
+    EXPECT_EQ(dimen1_ids.size(), 1);
+    auto dimen1_id = dimen1_ids[0];
+
+    auto icon_ids = res_table->get_res_ids_by_name("icon");
+    EXPECT_EQ(icon_ids.size(), 1);
+    auto files = res_table->get_files_by_rid(icon_ids[0]);
+    EXPECT_EQ(files.size(), 1);
+    EXPECT_EQ(*files.begin(), "res/drawable-mdpi-v4/icon.png");
+    files = res_table->get_files_by_rid(icon_ids[0], ResourcePathType::ZipPath);
+    EXPECT_EQ(files.size(), 1);
+    EXPECT_EQ(*files.begin(), "base/res/drawable-mdpi-v4/icon.png");
+
+    std::unordered_set<std::string> types = {"color"};
+    auto type_ids = res_table->get_types_by_name(types);
+    std::unordered_set<uint32_t> shifted_allow_type_ids;
+    for (auto& type_id : type_ids) {
+      shifted_allow_type_ids.emplace(type_id >> TYPE_INDEX_BIT_SHIFT);
+    }
+    std::map<std::string, std::string> filepath_old_to_new;
+    filepath_old_to_new["base/res/drawable-mdpi-v4/icon.png"] =
+        "base/res/a.png";
+    res_table->obfuscate_resource_and_serialize(
+        resources->find_resources_files(), filepath_old_to_new,
+        shifted_allow_type_ids, {"keep_me_unused_"}, {});
+
+    auto res_table_new = resources->load_res_table();
+
+    EXPECT_EQ(res_table_new->get_res_ids_by_name("bg_grey").size(), 0);
+    EXPECT_EQ(res_table_new->get_res_ids_by_name("prickly_green").size(), 0);
+    EXPECT_EQ(res_table_new->get_res_ids_by_name("keep_me_unused_color").size(),
+              1);
+    EXPECT_EQ(res_table_new->get_res_ids_by_name("unused_dimen_2").size(), 1);
+    EXPECT_EQ(res_table_new->get_res_ids_by_name("hex_or_file").size(), 0);
+    EXPECT_EQ(res_table_new->get_res_ids_by_name("hex_or_file2").size(), 0);
+    EXPECT_EQ(res_table_new->get_res_ids_by_name("duplicate_name").size(), 2);
+    EXPECT_EQ(res_table_new->get_res_ids_by_name(RESOURCE_NAME_REMOVED).size(),
+              7);
+    const auto& id_to_name = res_table_new->id_to_name;
+    EXPECT_EQ(id_to_name.at(color1_id), RESOURCE_NAME_REMOVED);
+    EXPECT_EQ(id_to_name.at(color3_id), RESOURCE_NAME_REMOVED);
+    EXPECT_EQ(id_to_name.at(hex_or_file2_id), RESOURCE_NAME_REMOVED);
+    EXPECT_EQ(id_to_name.at(hex_or_file_id), RESOURCE_NAME_REMOVED);
+    EXPECT_EQ(id_to_name.at(color2_id), "keep_me_unused_color");
+    EXPECT_EQ(id_to_name.at(dimen1_id), "unused_dimen_2");
+
+    icon_ids = res_table_new->get_res_ids_by_name("icon");
+    EXPECT_EQ(icon_ids.size(), 1);
+    files = res_table_new->get_files_by_rid(icon_ids[0]);
+    EXPECT_EQ(files.size(), 1);
+    EXPECT_EQ(*files.begin(), "res/a.png");
+    files =
+        res_table_new->get_files_by_rid(icon_ids[0], ResourcePathType::ZipPath);
+    EXPECT_EQ(files.size(), 1);
+    EXPECT_EQ(*files.begin(), "base/res/a.png");
+  });
+}
+
+TEST(BundleResources, GetConfigurations) {
+  setup_resources_and_run(
+      [&](const std::string& /* unused */, BundleResources* resources) {
+        auto res_table = resources->load_res_table();
+        EXPECT_EQ(res_table->package_count(), 1);
+        std::vector<android::ResTable_config> configs;
+        res_table->get_configurations(0x7f, "color", &configs);
+        EXPECT_EQ(configs.size(), 2);
+        EXPECT_STREQ(configs[0].toString().c_str(), "");
+        EXPECT_STREQ(configs[1].toString().c_str(), "night");
+        configs.clear();
+        res_table->get_configurations(0x7f, "dimen", &configs);
+        EXPECT_EQ(configs.size(), 2);
+        EXPECT_STREQ(configs[0].toString().c_str(), "");
+        EXPECT_STREQ(configs[1].toString().c_str(), "land");
+        configs.clear();
+        res_table->get_configurations(0x7f, "nope", &configs);
+        EXPECT_EQ(configs.size(), 0);
+      });
+}
+
+TEST(BundleResources, GetConfigsWithValue) {
+  setup_resources_and_run(
+      [&](const std::string& /* unused */, BundleResources* resources) {
+        auto res_table = resources->load_res_table();
+        EXPECT_EQ(res_table->package_count(), 1);
+        auto config_set = res_table->get_configs_with_values(0x7f04000f);
+        EXPECT_EQ(config_set.size(), 1);
+        EXPECT_STREQ(config_set.begin()->toString().c_str(), "land");
+
+        auto another_set = res_table->get_configs_with_values(0x7f030002);
+        EXPECT_EQ(another_set.size(), 2);
+        auto it = another_set.begin();
+        EXPECT_STREQ(it->toString().c_str(), "");
+        it++;
+        EXPECT_STREQ(it->toString().c_str(), "night");
+      });
 }

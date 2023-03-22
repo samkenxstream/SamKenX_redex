@@ -110,7 +110,7 @@ void AnalysisImpl::filter_list(const std::vector<std::string>& list,
                                bool keep_match) {
   if (list.empty()) return;
 
-  auto find_in_list = [&](const std::string& name) {
+  auto find_in_list = [&](const std::string_view name) {
     for (const std::string& el_name : list) {
       if (name.compare(0, el_name.size(), el_name) == 0) {
         return true;
@@ -122,7 +122,7 @@ void AnalysisImpl::filter_list(const std::vector<std::string>& list,
   for (const auto& intf_it : single_impls) {
     const auto intf = intf_it.first;
     const auto intf_cls = type_class(intf);
-    const std::string& intf_name = intf_cls->get_deobfuscated_name_or_empty();
+    const auto intf_name = intf_cls->get_deobfuscated_name_or_empty();
     bool match = find_in_list(intf_name);
     if (match && keep_match) continue;
     if (!match && !keep_match) continue;
@@ -134,7 +134,7 @@ void AnalysisImpl::filter_proguard_special_interface() {
   for (const auto& intf_it : single_impls) {
     const auto intf = intf_it.first;
     const auto intf_cls = type_class(intf);
-    const std::string& intf_name = intf_cls->get_deobfuscated_name_or_empty();
+    std::string intf_name = intf_cls->get_deobfuscated_name_or_empty_copy();
     if (pg_map.is_special_interface(intf_name)) {
       escape_interface(intf, FILTERED);
     }
@@ -145,7 +145,7 @@ void AnalysisImpl::filter_by_annotations(
     const std::vector<std::string>& blocklist) {
   std::unordered_set<DexType*> anno_types;
   for (const auto& s : blocklist) {
-    auto ty = DexType::get_type(s.c_str());
+    auto ty = DexType::get_type(s);
     if (ty != nullptr) {
       anno_types.emplace(ty);
     }
@@ -406,6 +406,18 @@ void AnalysisImpl::analyze_opcodes() {
     }
   };
 
+  auto check_return = [&](DexMethod* referrer,
+                          const IRList::iterator& insn_it,
+                          IRInstruction* insn) {
+    auto rtype = referrer->get_proto()->get_rtype();
+    auto intf = get_and_check_single_impl(rtype);
+    if (intf) {
+      auto& si = single_impls.at(intf);
+      std::lock_guard<std::mutex> lock(si.mutex);
+      si.referencing_methods[referrer][insn] = insn_it;
+    }
+  };
+
   walk::parallel::code(scope, [&](DexMethod* method, IRCode& code) {
     redex_assert(!code.editable_cfg_built()); // Need *one* way to
     auto ii = ir_list::InstructionIterable(code);
@@ -488,6 +500,10 @@ void AnalysisImpl::analyze_opcodes() {
       case OPCODE_INVOKE_SUPER: {
         const auto meth = insn->get_method();
         check_sig(method, it.unwrap(), meth, insn);
+        break;
+      }
+      case OPCODE_RETURN_OBJECT: {
+        check_return(method, it.unwrap(), insn);
         break;
       }
       default:

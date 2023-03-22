@@ -133,21 +133,21 @@ std::string show_type(const DexType* t, bool deobfuscated) {
         }
         auto name = t->get_name()->str();
         if (!deobfuscated) {
-          return name;
+          return str_copy(name);
         }
         if (name[0] == 'L') {
           auto cls = type_class(t);
           if (cls != nullptr &&
               !cls->get_deobfuscated_name_or_empty().empty()) {
-            return cls->get_deobfuscated_name_or_empty();
+            return cls->get_deobfuscated_name_or_empty_copy();
           }
-          return name;
+          return str_copy(name);
         } else if (name[0] == '[') {
           std::ostringstream ss;
           ss << '[' << self(self, DexType::get_type(name.substr(1)));
           return ss.str();
         }
-        return name;
+        return str_copy(name);
       },
       t);
 }
@@ -158,9 +158,9 @@ std::string show_field(const DexFieldRef* ref, bool deobfuscated) {
   }
 
   if (deobfuscated && ref->is_def()) {
-    const auto& name = ref->as_def()->get_deobfuscated_name_or_empty();
+    const auto name = ref->as_def()->get_deobfuscated_name_or_empty();
     if (!name.empty()) {
-      return name;
+      return str_copy(name);
     }
   }
   string_builders::StaticStringBuilder<5> b;
@@ -197,9 +197,9 @@ std::string show_method(const DexMethodRef* ref, bool deobfuscated) {
   }
 
   if (deobfuscated && ref->is_def()) {
-    const auto& name = ref->as_def()->get_deobfuscated_name_or_empty();
+    const auto name = ref->as_def()->get_deobfuscated_name_or_empty();
     if (!name.empty()) {
-      return name;
+      return str_copy(name);
     }
   }
 
@@ -207,6 +207,13 @@ std::string show_method(const DexMethodRef* ref, bool deobfuscated) {
   b << show_type(ref->get_class(), deobfuscated) << "." << show(ref->get_name())
     << ":" << show_proto(ref->get_proto(), deobfuscated);
   return b.str();
+}
+
+std::string show_methodhandle(const DexMethodHandle* ref, bool deobfuscated) {
+  if (ref == nullptr) {
+    return "";
+  }
+  return show_method(ref->methodref(), deobfuscated);
 }
 
 std::string show_opcode(const DexInstruction* insn, bool deobfuscated = false) {
@@ -892,6 +899,17 @@ std::string show_opcode(const DexInstruction* insn, bool deobfuscated = false) {
     ss << show_method(static_cast<const DexOpcodeMethod*>(insn)->get_method(),
                       deobfuscated);
     return ss.str();
+  case DOPCODE_CONST_METHOD_HANDLE:
+    ss << "const-method-handle ";
+    ss << show_methodhandle(
+        static_cast<const DexOpcodeMethodHandle*>(insn)->get_methodhandle(),
+        deobfuscated);
+    return ss.str();
+  case DOPCODE_CONST_METHOD_TYPE:
+    ss << "const-method-type ";
+    ss << show_proto(static_cast<const DexOpcodeProto*>(insn)->get_proto(),
+                     deobfuscated);
+    return ss.str();
   }
 }
 
@@ -956,6 +974,9 @@ std::string show_insn(const IRInstruction* insn, bool deobfuscated) {
       ss << show(insn->get_methodhandle());
     }
     break;
+  case opcode::Ref::Proto:
+    ss << show_proto(insn->get_proto(), deobfuscated);
+    break;
   }
   return ss.str();
 }
@@ -991,7 +1012,7 @@ std::ostream& operator<<(std::ostream& o, const DexType& type) {
 
 inline std::string show(const DexString* p) {
   if (!p) return "";
-  return p->str();
+  return p->str_copy();
 }
 
 inline std::string show(const DexType* t) { return show_type(t, false); }
@@ -1223,7 +1244,7 @@ static IntType read(const uint8_t*& data, uint16_t n_bytes) {
                 "Only read into integral values.");
   always_assert_log(sizeof(IntType) >= n_bytes,
                     "Should not read more bytes than sizeof(IntType)");
-  IntType result;
+  IntType result = 0;
   memcpy(&result, data, n_bytes);
   data += n_bytes;
   return result;
@@ -1606,9 +1627,9 @@ std::string show_deobfuscated(const DexClass* cls) {
   }
   const auto& deob = cls->get_deobfuscated_name_or_empty();
   if (!deob.empty()) {
-    return deob;
+    return str_copy(deob);
   }
-  return cls->get_name() ? cls->get_name()->str() : show(cls);
+  return cls->get_name() ? cls->get_name()->str_copy() : show(cls);
 }
 
 std::string show_deobfuscated(const DexFieldRef* ref) {

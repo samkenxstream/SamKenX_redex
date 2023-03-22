@@ -10,6 +10,9 @@
 
 #include <map>
 #include <memory>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "androidfw/ResourceTypes.h"
@@ -33,12 +36,50 @@ void push_u8_length(size_t len, android::Vector<char>* vec);
 void encode_string8(const android::String8& s, android::Vector<char>* vec);
 void encode_string16(const android::String16& s, android::Vector<char>* vec);
 
+// Returns the size of the entry and the value data structure(s) that follow it.
+size_t compute_entry_value_length(android::ResTable_entry* entry);
+// Return in device order the flags for the entry in the type
+uint32_t get_spec_flags(android::ResTable_typeSpec* spec, uint16_t entry_id);
+// Whether or not the two configs should be treated as equal (note: this is not
+// simply a byte by byte compare).
+bool are_configs_equivalent(android::ResTable_config* a,
+                            android::ResTable_config* b);
+
+// For a Res_value marked with FLAG_COMPLEX, return the value part.
+float complex_value(uint32_t complex);
+// For a Res_value marked with FLAG_COMPLEX, return the unit part.
+uint32_t complex_unit(uint32_t complex, bool isFraction);
+
+enum StringKind { STD_STRING, STRING_8, STRING_16 };
+
+struct StringHolder {
+  StringKind kind;
+  const char* string8;
+  const char16_t* string16;
+  const std::string str;
+  size_t length;
+  StringHolder(const char* s, size_t len)
+      : kind(StringKind::STRING_8),
+        string8(s),
+        string16(nullptr),
+        length(len) {}
+  StringHolder(const char16_t* s, size_t len)
+      : kind(StringKind::STRING_16),
+        string8(nullptr),
+        string16(s),
+        length(len) {}
+  StringHolder(std::string s, size_t len)
+      : kind(StringKind::STD_STRING),
+        string8(nullptr),
+        string16(nullptr),
+        str(std::move(s)),
+        length(len) {}
+};
+
 using SpanVector = std::vector<android::ResStringPool_span*>;
 
-template <typename T>
 struct StyleInfo {
-  T* string;
-  size_t len;
+  StringHolder str;
   SpanVector spans;
 };
 
@@ -48,8 +89,12 @@ using PtrLen = android::key_value_pair_t<T*, size_t>;
 class ResStringPoolBuilder {
  public:
   ResStringPoolBuilder(uint32_t flags) : m_flags(flags) {}
+  // Note: in all cases, callers must be encoding string data properly, per
+  // https://source.android.com/devices/tech/dalvik/dex-format#mutf-8
+  void add_string(std::string);
   void add_string(const char*, size_t);
   void add_string(const char16_t*, size_t);
+  void add_style(std::string, SpanVector);
   void add_style(const char*, size_t, SpanVector);
   void add_style(const char16_t*, size_t, SpanVector);
   void serialize(android::Vector<char>* out);
@@ -63,18 +108,174 @@ class ResStringPoolBuilder {
     return (m_flags & android::ResStringPool_header::UTF8_FLAG) != 0;
   }
 
-  size_t non_style_string_count() {
-    return is_utf8() ? m_strings8.size() : m_strings16.size();
-  }
+  size_t non_style_string_count() { return m_strings.size(); }
 
-  size_t style_count() {
-    return is_utf8() ? m_styles8.size() : m_styles16.size();
-  }
+  size_t style_count() { return m_styles.size(); }
 
-  android::Vector<PtrLen<char16_t>> m_strings16;
-  android::Vector<PtrLen<char>> m_strings8;
-  android::Vector<StyleInfo<char16_t>> m_styles16;
-  android::Vector<StyleInfo<char>> m_styles8;
+  std::vector<StringHolder> m_strings;
+  std::vector<StyleInfo> m_styles;
+};
+
+// From the given pointer to XML data (and the size of the data), write to `out`
+// an equivalent XML doc, but with a string pool specified by the builder.
+void replace_xml_string_pool(android::ResChunk_header* data,
+                             size_t len,
+                             ResStringPoolBuilder& builder,
+                             android::Vector<char>* out);
+
+using EntryValueData = PtrLen<uint8_t>;
+using EntryOffsetData = std::pair<EntryValueData, uint32_t>;
+
+bool is_empty(const EntryValueData& ev);
+
+// Return a pointer to the start of values beyond the entry struct at the given
+// pointer. Length returned will indicate how many more bytes there are that
+// constiture the values. Callers MUST always check the length, since it could
+// be zero (thus making the pointer not meaningful).
+PtrLen<uint8_t> get_value_data(const EntryValueData& ev);
+
+// Helper to record identical entry/value data that has already been emitted for
+// a certain type.
+class CanonicalEntries {
+ public:
+  CanonicalEntries() {}
+  // Returns true and sets the offset output parameter if identical data has
+  // already been noted. Sets the hash output param regardless.
+  bool find(const EntryValueData& data, size_t* out_hash, uint32_t* out_offset);
+  void record(EntryValueData data, size_t hash, uint32_t offset);
+
+ private:
+  size_t hash(const EntryValueData& data);
+  // Hash to pair of the entry/value bytes with the hash code, and the offset to
+  // the serialized data.
+  std::unordered_map<size_t, std::vector<EntryOffsetData>> m_canonical_entries;
+};
+
+inline bool any_sparse_types(
+    const std::vector<android::ResTable_type*>& configs) {
+  for (const auto& t : configs) {
+    if ((t->flags & android::ResTable_type::FLAG_SPARSE) != 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Builder for serializing a ResTable_typeSpec structure with N ResTable_type
+// structures (and entries). As with other Builder classes, this can be used two
+// ways:
+// 1) Create new type, entry data.
+// 2) Project deletions over existing data structures.
+class ResTableTypeBuilder {
+ public:
+  ResTableTypeBuilder(uint32_t package_id,
+                      uint8_t type,
+                      bool enable_canonical_entries,
+                      bool enable_sparse_encoding)
+      : m_package_id(package_id),
+        m_type(type),
+        m_enable_canonical_entries(enable_canonical_entries),
+        m_enable_sparse_encoding(enable_sparse_encoding) {
+    LOG_ALWAYS_FATAL_IF((package_id & 0xFFFFFF00) != 0,
+                        "package_id expected to have low byte set; got 0x%x",
+                        package_id);
+  }
+  virtual ~ResTableTypeBuilder() {}
+  uint8_t get_type_id() { return m_type; }
+  uint32_t make_id(size_t entry) {
+    return (m_package_id << 24) | (m_type << 16) | (entry & 0xFFFF);
+  }
+  bool should_encode_offsets_as_sparse(const std::vector<uint32_t>& offsets,
+                                       size_t entry_data_size);
+  void encode_offsets_as_sparse(std::vector<uint32_t>* offsets);
+  virtual void serialize(android::Vector<char>* out) = 0;
+
+ protected:
+  // The (unshifted) number of the package to which this type belongs.
+  uint32_t m_package_id;
+  // The non-zero ID of this type
+  uint8_t m_type;
+  // Whether or not to check for redundant entry/value data.
+  bool m_enable_canonical_entries;
+  // Allows the encoding of a ResTable_type to set FLAG_SPARSE and emit
+  // ResTable_sparseTypeEntry style entry offsets, if deemed beneficial for size
+  bool m_enable_sparse_encoding;
+};
+
+// Builder for projecting deletions over existing data ResTable_typeSpec and its
+// corresponding ResTable_type structures (as well as entries/values.)
+class ResTableTypeProjector : public ResTableTypeBuilder {
+ public:
+  ResTableTypeProjector(uint32_t package_id,
+                        android::ResTable_typeSpec* spec,
+                        std::vector<android::ResTable_type*> configs,
+                        bool enable_canonical_entries = false)
+      : ResTableTypeBuilder(package_id,
+                            spec->id,
+                            enable_canonical_entries,
+                            any_sparse_types(configs)),
+        m_spec(spec),
+        m_configs(std::move(configs)) {}
+  void remove_ids(std::unordered_set<uint32_t>& ids_to_remove,
+                  bool nullify_removed) {
+    m_ids_to_remove = ids_to_remove;
+    m_nullify_removed = nullify_removed;
+  }
+  void serialize(android::Vector<char>* out) override;
+  virtual ~ResTableTypeProjector() {}
+
+ private:
+  void serialize_type(android::ResTable_type*,
+                      size_t,
+                      android::Vector<char>* out);
+  android::ResTable_typeSpec* m_spec;
+  std::vector<android::ResTable_type*> m_configs;
+  // This takes effect during file serialization
+  std::unordered_set<uint32_t> m_ids_to_remove;
+  bool m_nullify_removed{false};
+};
+
+// Builder for defining a new ResTable_typeSpec along with its ResTable_type
+// structures, entries, values. In all cases, given data should be in device
+// order.
+class ResTableTypeDefiner : public ResTableTypeBuilder {
+ public:
+  ResTableTypeDefiner(uint32_t package_id,
+                      uint8_t id,
+                      std::vector<android::ResTable_config*> configs,
+                      std::vector<uint32_t> flags,
+                      bool enable_canonical_entries = false,
+                      bool enable_sparse_encoding = false)
+      : ResTableTypeBuilder(
+            package_id, id, enable_canonical_entries, enable_sparse_encoding),
+        m_configs(std::move(configs)),
+        m_flags(std::move(flags)) {}
+  // Adds a chunk of data representing an entry and value to the given config.
+  void add(android::ResTable_config* config, EntryValueData data) {
+    auto search = m_data.find(config);
+    if (search == m_data.end()) {
+      std::vector<EntryValueData> vec;
+      m_data.emplace(config, std::move(vec));
+    }
+    auto& vec = m_data.at(config);
+    vec.emplace_back(data);
+  }
+  // Convenience method to add empty entry/value to the given config.
+  void add_empty(android::ResTable_config* config) {
+    EntryValueData ev(nullptr, 0);
+    add(config, ev);
+  }
+  void serialize(android::Vector<char>* out) override;
+  virtual ~ResTableTypeDefiner() {}
+
+ private:
+  // NOTE: size of m_configs should match the size of m_data. Inner vectors of
+  // m_data should all have the same size, and that size should be equal to
+  // m_flag's size.
+  std::unordered_map<android::ResTable_config*, std::vector<EntryValueData>>
+      m_data;
+  const std::vector<android::ResTable_config*> m_configs;
+  const std::vector<uint32_t> m_flags;
 };
 
 // Struct for defining an existing type and the collection of entries in all
@@ -91,6 +292,9 @@ struct TypeInfo {
 class ResPackageBuilder {
  public:
   ResPackageBuilder() : m_package_name{0} {}
+  // Copies fields from the source package that will remain unchanged in the
+  // output (i.e. id, package name, etc).
+  ResPackageBuilder(android::ResTable_package* package);
   void set_id(uint32_t id) { m_id = id; };
   void set_last_public_type(uint32_t last_public_type) {
     m_last_public_type = last_public_type;
@@ -107,8 +311,16 @@ class ResPackageBuilder {
       m_package_name[i] = dtohs(package->name[i]);
     }
   }
+  // Adds type info which will be emitted as-is to the serialized package.
   void add_type(TypeInfo& info) {
-    m_id_to_type.emplace(info.spec->id, info);
+    auto pair = std::make_pair(nullptr, info);
+    m_id_to_type.emplace(info.spec->id, std::move(pair));
+  }
+  // Delegate to the builder to emit data when serializing.
+  void add_type(std::shared_ptr<ResTableTypeBuilder> builder) {
+    TypeInfo empty;
+    auto pair = std::make_pair(builder, std::move(empty));
+    m_id_to_type.emplace(builder->get_type_id(), std::move(pair));
   }
   void set_key_strings(std::shared_ptr<ResStringPoolBuilder> builder) {
     m_key_strings.first = builder;
@@ -130,11 +342,14 @@ class ResPackageBuilder {
  private:
   // Pairs here are meant to be used like a union, set only one of them (defined
   // as a pair simply to inspect which is set).
-  std::pair<std::shared_ptr<ResStringPoolBuilder>, android::ResStringPool_header*>
+  std::pair<std::shared_ptr<ResStringPoolBuilder>,
+            android::ResStringPool_header*>
       m_key_strings;
-  std::pair<std::shared_ptr<ResStringPoolBuilder>, android::ResStringPool_header*>
+  std::pair<std::shared_ptr<ResStringPoolBuilder>,
+            android::ResStringPool_header*>
       m_type_strings;
-  std::map<uint8_t, TypeInfo> m_id_to_type;
+  std::map<uint8_t, std::pair<std::shared_ptr<ResTableTypeBuilder>, TypeInfo>>
+      m_id_to_type;
   // Chunks to emit after all type info. Meant to represent any unparsed struct
   // like libraries, overlay, etc.
   std::vector<android::ResChunk_header*> m_unknown_chunks;
@@ -166,9 +381,11 @@ class ResTableBuilder {
  private:
   // Pairs here are meant to be used like a union, set only one of them (defined
   // as a pair simply to inspect which is set).
-  std::pair<std::shared_ptr<ResStringPoolBuilder>, android::ResStringPool_header*>
+  std::pair<std::shared_ptr<ResStringPoolBuilder>,
+            android::ResStringPool_header*>
       m_global_strings;
-  std::vector<std::pair<std::shared_ptr<ResPackageBuilder>, android::ResTable_package*>>
+  std::vector<
+      std::pair<std::shared_ptr<ResPackageBuilder>, android::ResTable_package*>>
       m_packages;
 };
 } // namespace arsc

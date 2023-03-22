@@ -115,9 +115,9 @@ std::string get_simple_deobf_name(const T* ref) {
   auto dot_pos = full_name.find('.');
   auto colon_pos = full_name.find(':');
   if (dot_pos == std::string::npos || colon_pos == std::string::npos) {
-    return full_name;
+    return str_copy(full_name);
   }
-  return full_name.substr(dot_pos + 1, colon_pos - dot_pos - 1);
+  return str_copy(full_name.substr(dot_pos + 1, colon_pos - dot_pos - 1));
 }
 } // namespace
 
@@ -138,8 +138,8 @@ int32_t DexString::java_hashcode() const {
 
 int DexTypeList::encode(DexOutputIdx* dodx, uint32_t* output) const {
   uint16_t* typep = (uint16_t*)(output + 1);
-  *output = (uint32_t)m_list->size();
-  for (auto const& type : *m_list) {
+  *output = (uint32_t)m_list.size();
+  for (auto const& type : m_list) {
     *typep++ = dodx->typeidx(type);
   }
   return (int)(((uint8_t*)typep) - (uint8_t*)output);
@@ -148,35 +148,41 @@ int DexTypeList::encode(DexOutputIdx* dodx, uint32_t* output) const {
 DexTypeList* DexTypeList::push_front(DexType* t) const {
   ContainerType new_list;
   new_list.push_back(t);
-  new_list.insert(new_list.end(), m_list->begin(), m_list->end());
+  new_list.insert(new_list.end(), m_list.begin(), m_list.end());
   return make_type_list(std::move(new_list));
 }
 
 DexTypeList* DexTypeList::pop_front() const {
-  redex_assert(!m_list->empty());
-  ContainerType new_list{m_list->begin() + 1, m_list->end()};
+  redex_assert(!m_list.empty());
+  ContainerType new_list{m_list.begin() + 1, m_list.end()};
   return make_type_list(std::move(new_list));
 }
 DexTypeList* DexTypeList::pop_front(size_t n) const {
-  redex_assert(m_list->size() >= n);
-  ContainerType new_list{m_list->begin() + n, m_list->end()};
+  redex_assert(m_list.size() >= n);
+  ContainerType new_list{m_list.begin() + n, m_list.end()};
+  return make_type_list(std::move(new_list));
+}
+
+DexTypeList* DexTypeList::pop_back(size_t n) const {
+  redex_assert(m_list.size() >= n);
+  ContainerType new_list{m_list.begin(), m_list.end() - n};
   return make_type_list(std::move(new_list));
 }
 
 DexTypeList* DexTypeList::push_back(DexType* t) const {
-  ContainerType new_list{*m_list};
+  ContainerType new_list{m_list};
   new_list.push_back(t);
   return make_type_list(std::move(new_list));
 }
 DexTypeList* DexTypeList::push_back(const std::vector<DexType*>& t) const {
-  ContainerType new_list{*m_list};
+  ContainerType new_list{m_list};
   new_list.insert(new_list.end(), t.begin(), t.end());
   return make_type_list(std::move(new_list));
 }
 
 DexTypeList* DexTypeList::replace_head(DexType* new_head) const {
-  redex_assert(!m_list->empty());
-  ContainerType new_list{*m_list};
+  redex_assert(!m_list.empty());
+  ContainerType new_list{m_list};
   new_list[0] = new_head;
   return make_type_list(std::move(new_list));
 }
@@ -219,6 +225,15 @@ void DexFieldRef::change(const DexFieldSpec& ref, bool rename_on_collision) {
 
 void DexFieldRef::erase_field(DexFieldRef* f) {
   return g_redex->erase_field(f);
+}
+
+dex_member_refs::FieldDescriptorTokens DexFieldRef::get_descriptor_tokens()
+    const {
+  dex_member_refs::FieldDescriptorTokens res;
+  res.cls = get_class()->str();
+  res.name = get_name()->str();
+  res.type = get_type()->str();
+  return res;
 }
 
 DexFieldRef* DexField::get_field(
@@ -730,10 +745,12 @@ DexMethod::DexMethod(DexType* type, const DexString* name, DexProto* proto)
 
 DexMethod::~DexMethod() = default;
 
+void DexMethod::delete_method(DexMethod* m) { m->make_non_concrete(); }
+
 std::string DexMethod::get_fully_deobfuscated_name() const {
   if (m_deobfuscated_name != nullptr &&
       get_deobfuscated_name().str() == show(this)) {
-    return get_deobfuscated_name().str();
+    return get_deobfuscated_name().str_copy();
   }
   return build_fully_deobfuscated_name(this);
 }
@@ -870,12 +887,12 @@ DexMethodRef* DexMethod::make_method(
     const std::string& return_type) {
   DexTypeList::ContainerType dex_types;
   for (const std::string& type_str : arg_types) {
-    dex_types.push_back(DexType::make_type(type_str.c_str()));
+    dex_types.push_back(DexType::make_type(type_str));
   }
   return DexMethod::make_method(
-      DexType::make_type(class_type.c_str()),
+      DexType::make_type(class_type),
       DexString::make_string(name),
-      DexProto::make_proto(DexType::make_type(return_type.c_str()),
+      DexProto::make_proto(DexType::make_type(return_type),
                            DexTypeList::make_type_list(std::move(dex_types))));
 }
 
@@ -932,6 +949,19 @@ void DexMethod::attach_param_annotation_set(
 
 std::unique_ptr<DexAnnotationSet> DexMethod::release_annotations() {
   return std::move(m_anno);
+}
+
+DexLocation::DexLocation(std::string store_name, std::string file_name)
+    : m_store_name(std::move(store_name)), m_file_name(std::move(file_name)) {}
+
+const DexLocation* DexLocation::make_location(std::string_view store_name,
+                                              std::string_view file_name) {
+  return g_redex->make_location(store_name, file_name);
+}
+
+const DexLocation* DexLocation::get_location(std::string_view store_name,
+                                             std::string_view file_name) {
+  return g_redex->get_location(store_name, file_name);
 }
 
 void DexClass::set_deobfuscated_name(const std::string& name) {
@@ -1007,13 +1037,6 @@ void DexClass::remove_method(const DexMethod* m) {
   redex_assert(erased);
 }
 
-void DexClass::remove_method_definition(DexMethod* m) {
-  remove_method(m);
-  // Virtually delete the definition of the method.
-  m->m_concrete = false;
-  m->release_code();
-}
-
 void DexMethod::become_virtual() {
   redex_assert(!m_virtual);
   auto cls = type_class(m_spec.cls);
@@ -1060,6 +1083,7 @@ void DexMethod::make_non_concrete() {
   m_code.reset();
   m_virtual = false;
   m_param_anno.reset();
+  m_anno.reset();
 }
 
 void DexMethod::set_deobfuscated_name(const std::string& name) {
@@ -1500,7 +1524,7 @@ DexAnnotationDirectory* DexClass::get_annotation_directory() {
 
 DexClass* DexClass::create(DexIdx* idx,
                            const dex_class_def* cdef,
-                           const std::string& location) {
+                           const DexLocation* location) {
   DexClass* cls = new DexClass(idx, cdef, location);
   if (g_redex->class_already_loaded(cls)) {
     // FIXME: This isn't deterministic. We're keeping whichever class we loaded
@@ -1517,11 +1541,11 @@ DexClass* DexClass::create(DexIdx* idx,
   return cls;
 }
 
-DexClass::DexClass(const std::string& location) : m_location(location) {}
+DexClass::DexClass(const DexLocation* location) : m_location(location) {}
 
 DexClass::DexClass(DexIdx* idx,
                    const dex_class_def* cdef,
-                   const std::string& location)
+                   const DexLocation* location)
     : m_super_class(idx->get_typeidx(cdef->super_idx)),
       m_self(idx->get_typeidx(cdef->typeidx)),
       m_interfaces(idx->get_type_list(cdef->interfaces_off)),
@@ -1536,7 +1560,7 @@ DexClass::~DexClass() = default; // For forwarding.
 
 template <typename C>
 void DexTypeList::gather_types(C& ltype) const {
-  c_append_all(ltype, m_list->begin(), m_list->end());
+  c_append_all(ltype, m_list.begin(), m_list.end());
 }
 INSTANTIATE(DexTypeList::gather_types, DexType*)
 
@@ -1566,6 +1590,8 @@ DexProto* DexProto::make_proto(const DexType* rtype, const DexTypeList* args) {
 DexProto* DexProto::get_proto(const DexType* rtype, const DexTypeList* args) {
   return g_redex->get_proto(rtype, args);
 }
+
+bool DexProto::is_void() const { return get_rtype() == type::_void(); }
 
 template <typename C>
 void DexProto::gather_types(C& ltype) const {
@@ -1753,6 +1779,23 @@ void DexClass::gather_methods(C& lmethod) const {
   }
 }
 INSTANTIATE(DexClass::gather_methods, DexMethodRef*)
+
+size_t DexClass::estimated_size() const {
+  // These values are derived from the size of metadata for each class or field.
+  constexpr size_t base_size = 48;
+  constexpr size_t field_size = 8;
+
+  size_t size =
+      base_size + field_size * (get_ifields().size() + get_sfields().size());
+  for (const auto m : get_vmethods()) {
+    size += m->estimated_size();
+  }
+
+  for (const auto m : get_dmethods()) {
+    size += m->estimated_size();
+  }
+  return size;
+}
 
 const DexField* DexFieldRef::as_def() const {
   if (is_def()) {
@@ -2095,6 +2138,12 @@ void DexMethod::add_load_params(size_t num_add_loads) {
   }
 }
 
+size_t DexMethod::estimated_size() const {
+  constexpr size_t method_metadata_size = 20;
+  return method_metadata_size +
+         (get_code() ? get_code()->sum_opcode_sizes() : 0);
+}
+
 void gather_components(std::vector<const DexString*>& lstring,
                        std::vector<DexType*>& ltype,
                        std::vector<DexFieldRef*>& lfield,
@@ -2169,6 +2218,18 @@ void DexMethodRef::erase_method(DexMethodRef* mref) {
                             m->get_proto());
     }
   }
+}
+
+dex_member_refs::MethodDescriptorTokens DexMethodRef::get_descriptor_tokens()
+    const {
+  dex_member_refs::MethodDescriptorTokens res;
+  res.cls = get_class()->str();
+  res.name = get_name()->str();
+  for (auto t : *get_proto()->get_args()) {
+    res.args.push_back(t->str());
+  }
+  res.rtype = get_proto()->get_rtype()->str();
+  return res;
 }
 
 DexClass* type_class(const DexType* t) { return g_redex->type_class(t); }

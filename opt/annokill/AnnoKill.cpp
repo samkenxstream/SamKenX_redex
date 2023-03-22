@@ -55,7 +55,7 @@ AnnoKill::AnnoKill(
   // Load annotations that should not be deleted.
   TRACE(ANNO, 2, "Keep annotations count %zu", keep.size());
   for (const auto& anno_name : keep) {
-    auto anno_type = DexType::get_type(anno_name.c_str());
+    auto anno_type = DexType::get_type(anno_name);
     TRACE(ANNO, 2, "Keep annotation type string %s", anno_name.c_str());
     if (anno_type) {
       TRACE(ANNO, 2, "Keep annotation type %s", SHOW(anno_type));
@@ -79,7 +79,7 @@ AnnoKill::AnnoKill(
 
   // Load annotations we know and want dead.
   for (auto const& anno_name : force_kill) {
-    DexType* anno = DexType::get_type(anno_name.c_str());
+    DexType* anno = DexType::get_type(anno_name);
     TRACE(ANNO, 2, "Force kill annotation type string %s", anno_name.c_str());
     if (anno) {
       TRACE(ANNO, 2, "Force kill anno: %s", SHOW(anno));
@@ -101,7 +101,7 @@ AnnoKill::AnnoKill(
     TypeSet type_refs;
     get_all_children_or_implementors(ch, m_scope, type_cls, type_refs);
     for (auto& anno : it.second) {
-      auto* anno_type = DexType::get_type(anno.c_str());
+      auto* anno_type = DexType::get_type(anno);
       for (auto type_ref : type_refs) {
         m_anno_class_hierarchy_keep[type_ref].insert(anno_type);
       }
@@ -118,9 +118,9 @@ AnnoKill::AnnoKill(
   }
   // Populate anno keep map
   for (const auto& it : annotated_keep_annos) {
-    auto* type = DexType::get_type(it.first.c_str());
+    auto* type = DexType::get_type(it.first);
     for (auto& anno : it.second) {
-      auto* anno_type = DexType::get_type(anno.c_str());
+      auto* anno_type = DexType::get_type(anno);
       m_annotated_keep_annos[type].insert(anno_type);
     }
   }
@@ -464,8 +464,10 @@ bool AnnoKill::should_kill_bad_signature(DexAnnotation* da) const {
     auto const& evs = arrayev->evalues();
     for (auto& strev : *evs) {
       if (strev->evtype() != DEVT_STRING) continue;
-      const auto& sigstr =
-          static_cast<DexEncodedValueString*>(strev.get())->string()->str();
+      const std::string sigstr =
+          static_cast<DexEncodedValueString*>(strev.get())
+              ->string()
+              ->str_copy();
       always_assert(sigstr.length() > 0);
       const auto* sigcstr = sigstr.c_str();
       // @Signature grammar is non-trivial[1], nevermind the fact that
@@ -485,7 +487,7 @@ bool AnnoKill::should_kill_bad_signature(DexAnnotation* da) const {
       // [1] androidxref.com/8.0.0_r4/xref/libcore/luni/src/main/java/libcore/
       //     reflect/GenericSignatureParser.java
       if (sigstr[0] == 'L' && strchr(sigcstr, '/') && !strchr(sigcstr, ':')) {
-        auto* sigtype = DexType::get_type(sigstr.c_str());
+        auto* sigtype = DexType::get_type(sigstr);
         if (!sigtype) {
           // Try with semicolon.
           sigtype = DexType::get_type(sigstr + ';');
@@ -493,7 +495,7 @@ bool AnnoKill::should_kill_bad_signature(DexAnnotation* da) const {
         if (!sigtype && sigstr.back() == '<') {
           // Try replacing angle bracket with semicolon
           // d8 often encodes signature annotations this way
-          std::string copy = sigstr;
+          std::string copy = str_copy(sigstr);
           copy.pop_back();
           copy.push_back(';');
           sigtype = DexType::get_type(copy);
@@ -689,15 +691,21 @@ bool AnnoKill::kill_annotations() {
 
   if (traceEnabled(ANNO, 3)) {
     for (const auto& p : m_build_anno_map) {
-      TRACE(ANNO, 3, "Build anno: %lu, %s", p.second, p.first.c_str());
+      TRACE(
+          ANNO, 3, "Build anno: %lu, %s", p.second, str_copy(p.first).c_str());
     }
 
     for (const auto& p : m_runtime_anno_map) {
-      TRACE(ANNO, 3, "Runtime anno: %lu, %s", p.second, p.first.c_str());
+      TRACE(ANNO,
+            3,
+            "Runtime anno: %lu, %s",
+            p.second,
+            str_copy(p.first).c_str());
     }
 
     for (const auto& p : m_system_anno_map) {
-      TRACE(ANNO, 3, "System anno: %lu, %s", p.second, p.first.c_str());
+      TRACE(
+          ANNO, 3, "System anno: %lu, %s", p.second, str_copy(p.first).c_str());
     }
   }
 
@@ -711,7 +719,7 @@ void AnnoKillPass::run_pass(DexStoresVector& stores,
   auto scope = build_class_scope(stores);
 
   AnnoKill ak(scope,
-              only_force_kill(),
+              m_only_force_kill,
               m_kill_bad_signatures,
               m_keep_annos,
               m_kill_annos,

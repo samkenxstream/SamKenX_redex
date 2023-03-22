@@ -12,9 +12,13 @@
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <iostream>
+#include <json/json.h>
 #include <limits>
 #include <list>
+#include <mutex>
+#include <sstream>
 #include <thread>
 #include <typeinfo>
 #include <unordered_set>
@@ -29,6 +33,7 @@
 #include "ApiLevelChecker.h"
 #include "AssetManager.h"
 #include "CFGMutation.h"
+#include "ClassChecker.h"
 #include "CommandProfiling.h"
 #include "ConfigFiles.h"
 #include "Debug.h"
@@ -36,6 +41,7 @@
 #include "DexLoader.h"
 #include "DexOutput.h"
 #include "DexUtil.h"
+#include "GlobalConfig.h"
 #include "GraphVisualizer.h"
 #include "IRCode.h"
 #include "IRTypeChecker.h"
@@ -48,9 +54,11 @@
 #include "PrintSeeds.h"
 #include "ProguardPrintConfiguration.h"
 #include "ProguardReporting.h"
+#include "Purity.h"
 #include "ReachableClasses.h"
 #include "Sanitizers.h"
 #include "ScopedCFG.h"
+#include "ScopedMemStats.h"
 #include "ScopedMetrics.h"
 #include "Show.h"
 #include "SourceBlocks.h"
@@ -74,8 +82,8 @@ const Pass* get_profiled_pass(const PassManager& mgr) {
   return pass;
 }
 
-std::string get_apk_dir(const Json::Value& config) {
-  auto apkdir = config["apk_dir"].asString();
+std::string get_apk_dir(const ConfigFiles& config) {
+  auto apkdir = config.get_json_config()["apk_dir"].asString();
   apkdir.erase(std::remove(apkdir.begin(), apkdir.end(), '"'), apkdir.end());
   return apkdir;
 }
@@ -104,6 +112,8 @@ class CheckerConfig {
 
     m_check_num_of_refs =
         type_checker_args.get("check_num_of_refs", false).asBool();
+
+    m_check_classes = type_checker_args.get("check_classes", true).asBool();
 
     for (auto& trigger_pass : type_checker_args["run_after_passes"]) {
       m_type_checker_trigger_passes.insert(trigger_pass.asString());
@@ -285,27 +295,42 @@ class CheckerConfig {
           return Result(dex_method);
         });
 
-    if (res.errors == 0) {
+    if (res.errors != 0) {
+      // Re-run the smallest method to produce error message.
+      auto checker = run_checker(res.smallest_error_method);
+      redex_assert(checker.fail());
+
+      std::ostringstream oss;
+      oss << "Inconsistency found in Dex code for "
+          << show(res.smallest_error_method) << std::endl
+          << " " << checker.what() << std::endl
+          << "Code:" << std::endl
+          << run_checker_error(res.smallest_error_method);
+
+      if (res.errors > 1) {
+        oss << "\n(" << (res.errors - 1) << " more issues!)";
+      }
+
+      always_assert_log(!exit_on_fail, "%s", oss.str().c_str());
+      return oss.str();
+    }
+
+    if (!m_check_classes) {
       return boost::none;
     }
 
-    // Re-run the smallest method to produce error message.
-    auto checker = run_checker(res.smallest_error_method);
-    redex_assert(checker.fail());
+    TRACE(PM, 1, "Running NonAbstractClassChecker...");
+    Timer t1("NonAbstractClassChecker");
 
-    std::ostringstream oss;
-    oss << "Inconsistency found in Dex code for "
-        << show(res.smallest_error_method) << std::endl
-        << " " << checker.what() << std::endl
-        << "Code:" << std::endl
-        << run_checker_error(res.smallest_error_method);
-
-    if (res.errors > 1) {
-      oss << "\n(" << (res.errors - 1) << " more issues!)";
+    ClassChecker class_checker;
+    class_checker.run(scope);
+    if (class_checker.fail()) {
+      std::ostringstream oss = class_checker.print_failed_classes();
+      always_assert_log(!exit_on_fail, "%s", oss.str().c_str());
+      return oss.str();
     }
 
-    always_assert_log(!exit_on_fail, "%s", oss.str().c_str());
-    return oss.str();
+    return boost::none;
   }
 
   static void fail_error(const std::string& error_msg, size_t errors = 1) {
@@ -329,35 +354,7 @@ class CheckerConfig {
   bool m_validate_access{true};
   bool m_annotated_cfg_on_error{false};
   bool m_annotated_cfg_on_error_reduced{true};
-};
-
-class ScopedVmHWM {
- public:
-  explicit ScopedVmHWM(bool enabled, bool reset) : m_enabled(enabled) {
-    if (enabled) {
-      if (reset) {
-        try_reset_hwm_mem_stat();
-      }
-      m_before = get_mem_stats().vm_hwm;
-    }
-  }
-
-  void trace_log(PassManager* mgr, const Pass* pass) {
-    if (m_enabled) {
-      uint64_t after = get_mem_stats().vm_hwm;
-      if (mgr != nullptr) {
-        mgr->set_metric("vm_hwm_after", after);
-        mgr->set_metric("vm_hwm_delta", after - m_before);
-      }
-      TRACE(STATS, 1, "VmHWM for %s was %s (%s over start).",
-            pass->name().c_str(), pretty_bytes(after).c_str(),
-            pretty_bytes(after - m_before).c_str());
-    }
-  }
-
- private:
-  uint64_t m_before;
-  bool m_enabled;
+  bool m_check_classes;
 };
 
 class CheckUniqueDeobfuscatedNames {
@@ -575,6 +572,17 @@ void process_method_profiles(PassManager& mgr, ConfigFiles& conf) {
                  conf.get_method_profiles().unresolved_size());
 }
 
+void process_secondary_method_profiles(PassManager& mgr, ConfigFiles& conf) {
+  // New methods might have been introduced by this pass; process previously
+  // unresolved methods to see if we can match them now (so that future passes
+  // using method profiles benefit)
+  conf.process_unresolved_secondary_method_profile_lines();
+  mgr.set_metric("~result~SecondaryMethodProfiles~",
+                 conf.get_secondary_method_profiles().size());
+  mgr.set_metric("~result~SecondaryMethodProfiles~unresolved~",
+                 conf.get_secondary_method_profiles().unresolved_size());
+}
+
 void maybe_write_hashes_incoming(const ConfigFiles& conf, const Scope& scope) {
   if (conf.emit_incoming_hashes()) {
     TRACE(PM, 1, "Writing incoming hashes...");
@@ -607,7 +615,7 @@ void maybe_write_env_seeds_file(const ConfigFiles& conf, const Scope& scope) {
 void maybe_print_seeds_incoming(
     const ConfigFiles& conf,
     const Scope& scope,
-    const std::unique_ptr<keep_rules::ProguardConfiguration>& pg_config) {
+    const std::unique_ptr<const keep_rules::ProguardConfiguration>& pg_config) {
   if (!conf.get_printseeds().empty()) {
     Timer t("Writing seeds to file " + conf.get_printseeds());
     std::ofstream seeds_file(conf.get_printseeds());
@@ -657,17 +665,11 @@ bool is_run_hasher_after_each_pass(const ConfigFiles& conf,
   return hasher_args.get("run_after_each_pass", false).asBool();
 }
 
-AssessorConfig get_assessor_config(const ConfigFiles& conf,
-                                   const RedexOptions&) {
-  const Json::Value& assessor_args = conf.get_json_config()["assessor"];
-  AssessorConfig res;
-  res.run_after_each_pass =
-      assessor_args.get("run_after_each_pass", false).asBool();
-  res.run_initially = assessor_args.get("run_initially", false).asBool();
-  res.run_finally = assessor_args.get("run_finally", false).asBool();
-  res.run_sb_consistency =
-      assessor_args.get("run_sb_consistency", false).asBool();
-  return res;
+void ensure_editable_cfg(DexStoresVector& stores) {
+  auto temp_scope = build_class_scope(stores);
+  walk::parallel::code(temp_scope, [&](DexMethod*, IRCode& code) {
+    code.build_cfg(/* editable */ true, /*fresh_editable_build*/ false);
+  });
 }
 
 class AfterPassSizes {
@@ -826,11 +828,17 @@ class AfterPassSizes {
       close(STDERR_FILENO);
     }
 
+    // Ensure that aborts work correctly.
+    set_abort_if_not_this_thread();
+
     auto maybe_run = [&](const char* pass_name) {
       auto pass = m_mgr->find_pass(pass_name);
       if (pass != nullptr) {
         if (m_debug) {
           std::cerr << "Running " << pass_name << std::endl;
+        }
+        if (pass->is_editable_cfg_friendly()) {
+          ensure_editable_cfg(*stores);
         }
         pass->run_pass(*stores, *conf, *m_mgr);
       }
@@ -946,16 +954,100 @@ class TraceClassAfterEachPass {
 
 static TraceClassAfterEachPass trace_cls;
 
+struct JemallocStats {
+  PassManager* pm;
+  const ConfigFiles& c;
+  bool full_stats{false};
+
+  JemallocStats(PassManager* pm, const ConfigFiles& c) : pm(pm), c(c) {
+    const auto* pmc =
+        c.get_global_config().get_config_by_name<PassManagerConfig>(
+            "pass_manager");
+    redex_assert(pmc != nullptr);
+
+    full_stats = pmc->jemalloc_full_stats;
+  }
+
+  void process_jemalloc_stats_for_pass(const Pass* pass, size_t run) {
+#ifdef USE_JEMALLOC
+    std::string key_base = "~jemalloc.";
+    auto cb = [&](const char* key, uint64_t value) {
+      pm->set_metric(key_base + key, value);
+    };
+    jemalloc_util::some_malloc_stats(cb);
+
+    if (full_stats) {
+      std::string name =
+          "jemalloc." + pass->name() + "." + std::to_string(run) + ".json";
+      auto filename = c.metafile(name);
+      std::ofstream ofs{filename};
+      ofs << jemalloc_util::get_malloc_stats();
+    }
+#endif
+  }
+};
+
+struct ViolationsTracking {
+  bool enabled{false};
+
+  explicit ViolationsTracking(bool enabled) : enabled(enabled) {}
+
+  struct Handler {
+    PassManager* pm;
+    std::unique_ptr<source_blocks::ViolationsHelper> vh;
+    Handler(PassManager* pm, DexStoresVector& stores)
+        : pm(pm),
+          vh(std::make_unique<source_blocks::ViolationsHelper>(
+              source_blocks::ViolationsHelper::Violation::kChainAndDom,
+              build_class_scope(stores),
+              10,
+              std::vector<std::string>{})) {}
+    ~Handler() {
+      if (vh != nullptr) {
+        ScopedMetrics sm(*pm);
+        auto scope = sm.scope("~violation~tracking");
+        vh->process(&sm);
+      }
+    }
+
+    Handler(const Handler&) = delete;
+    Handler& operator=(const Handler&) = delete;
+
+    Handler(Handler&& other) noexcept : pm(other.pm), vh(std::move(other.vh)) {}
+    Handler& operator=(Handler&& rhs) noexcept {
+      if (vh != nullptr) {
+        vh->silence();
+      }
+      vh = std::move(rhs.vh);
+      pm = rhs.pm;
+      return *this;
+    }
+  };
+
+  std::optional<Handler> maybe_track(PassManager* pm, DexStoresVector& stores) {
+    if (!enabled) {
+      return std::nullopt;
+    }
+    return Handler(pm, stores);
+  }
+};
+
 } // namespace
 
 std::unique_ptr<keep_rules::ProguardConfiguration> empty_pg_config() {
   return std::make_unique<keep_rules::ProguardConfiguration>();
 }
 
+struct PassManager::InternalFields {
+  std::mutex m_metrics_lock;
+};
+
 PassManager::PassManager(const std::vector<Pass*>& passes)
-    : PassManager(passes, Json::Value(Json::objectValue), RedexOptions{}) {}
+    : PassManager(
+          passes, ConfigFiles(Json::Value(Json::objectValue)), RedexOptions{}) {
+}
 PassManager::PassManager(const std::vector<Pass*>& passes,
-                         const Json::Value& config,
+                         const ConfigFiles& config,
                          const RedexOptions& options)
     : PassManager(passes, empty_pg_config(), config, options) {}
 
@@ -964,19 +1056,20 @@ PassManager::PassManager(
     std::unique_ptr<keep_rules::ProguardConfiguration> pg_config)
     : PassManager(passes,
                   std::move(pg_config),
-                  Json::Value(Json::objectValue),
+                  ConfigFiles(Json::Value(Json::objectValue)),
                   RedexOptions{}) {}
 PassManager::PassManager(
     const std::vector<Pass*>& passes,
     std::unique_ptr<keep_rules::ProguardConfiguration> pg_config,
-    const Json::Value& config,
+    const ConfigFiles& config,
     const RedexOptions& options)
     : m_asset_mgr(get_apk_dir(config)),
       m_registered_passes(passes),
       m_current_pass_info(nullptr),
       m_pg_config(std::move(pg_config)),
       m_redex_options(options),
-      m_testing_mode(false) {
+      m_testing_mode(false),
+      m_internal_fields(new InternalFields()) {
   init(config);
   if (getenv("MALLOC_PROFILE_PASS")) {
     m_malloc_profile_pass = find_pass(getenv("MALLOC_PROFILE_PASS"));
@@ -988,19 +1081,36 @@ PassManager::PassManager(
 
 PassManager::~PassManager() {}
 
-void PassManager::init(const Json::Value& config) {
-  if (config["redex"].isMember("passes")) {
-    const auto& redex = config["redex"];
-    auto passes_from_config = redex["passes"];
+void PassManager::init(const ConfigFiles& config) {
+  if (config.get_json_config().contains("redex") &&
+      config.get_json_config().get("redex", Json::Value()).isMember("passes")) {
+    PassManagerConfig default_config;
+    auto& pm_config = [&]() -> PassManagerConfig& {
+      if (!config.get_global_config().has_config_by_name("pass_manager")) {
+        return default_config;
+      }
+      return *config.get_global_config().get_config_by_name<PassManagerConfig>(
+          "pass_manager");
+    }();
+    auto get_alias = [pm_config](const auto& name) -> const std::string* {
+      auto it = pm_config.pass_aliases.find(name);
+      if (it == pm_config.pass_aliases.end()) {
+        return nullptr;
+      }
+      return &it->second;
+    };
+
+    const auto& json_config = config.get_json_config();
+    const auto& passes_from_config = json_config["redex"]["passes"];
     for (const auto& pass : passes_from_config) {
       std::string pass_name = pass.asString();
 
       // Check whether it is explicitly disabled.
-      auto is_disabled = [&config, &pass_name]() {
-        if (!config.isMember(pass_name)) {
+      auto is_disabled = [&json_config, &pass_name]() {
+        if (!json_config.contains(pass_name.c_str())) {
           return false;
         }
-        const auto& pass_data = config[pass_name];
+        const auto& pass_data = json_config[pass_name.c_str()];
         if (!pass_data.isMember("disabled")) {
           return false;
         }
@@ -1010,14 +1120,16 @@ void PassManager::init(const Json::Value& config) {
         continue;
       }
 
-      activate_pass(pass_name, config);
+      activate_pass(pass_name, get_alias(pass_name),
+                    config.get_json_config().unwrap());
     }
   } else {
     // If config isn't set up, run all registered passes.
     m_activated_passes = m_registered_passes;
     // But do not forget to initialize them.
+    const auto& json_config = config.get_json_config();
     for (auto* pass : m_activated_passes) {
-      pass->parse_config(JsonWrapper(config[pass->name()]));
+      pass->parse_config(JsonWrapper(json_config[pass->name().c_str()]));
     }
   }
 
@@ -1039,7 +1151,8 @@ void PassManager::init(const Json::Value& config) {
     m_pass_info[i].total_repeat = pass_repeats.at(pass);
     m_pass_info[i].name = pass->name() + "#" + std::to_string(count + 1);
     m_pass_info[i].metrics[PASS_ORDER_KEY] = i;
-    m_pass_info[i].config = JsonWrapper(config[pass->name()]);
+    m_pass_info[i].config =
+        JsonWrapper(config.get_json_config()[pass->name().c_str()]);
   }
 }
 
@@ -1085,6 +1198,11 @@ void PassManager::eval_passes(DexStoresVector& stores, ConfigFiles& conf) {
 }
 
 void PassManager::run_passes(DexStoresVector& stores, ConfigFiles& conf) {
+  const auto* pm_config =
+      conf.get_global_config().get_config_by_name<PassManagerConfig>(
+          "pass_manager");
+  redex_assert(pm_config != nullptr);
+
   auto profiler_info = ScopedCommandProfiling::maybe_info_from_env("");
   const Pass* profiler_info_pass = nullptr;
   if (profiler_info) {
@@ -1128,8 +1246,8 @@ void PassManager::run_passes(DexStoresVector& stores, ConfigFiles& conf) {
       is_run_hasher_after_each_pass(conf, get_redex_options());
 
   // Retrieve the assessor's settings.
-  m_assessor_config = ::get_assessor_config(conf, get_redex_options());
-  const auto& assessor_config = this->get_assessor_config();
+  const auto* assessor_config =
+      conf.get_global_config().get_config_by_name<AssessorConfig>("assessor");
 
   // Retrieve the type checker's settings.
   CheckerConfig checker_conf{conf};
@@ -1147,10 +1265,13 @@ void PassManager::run_passes(DexStoresVector& stores, ConfigFiles& conf) {
   check_unique_deobfuscated.run_initially(scope);
 
   VisualizerHelper graph_visualizer(conf);
+  ViolationsTracking violatios_tracking(
+      pm_config->violations_tracking ||
+      (assessor_config->run_after_each_pass && g_redex->instrument_mode));
 
   sanitizers::lsan_do_recoverable_leak_check();
 
-  const bool hwm_pass_stats =
+  const bool mem_pass_stats =
       traceEnabled(STATS, 1) || conf.get_json_config().get("mem_stats", true);
   const bool hwm_per_pass =
       conf.get_json_config().get("mem_stats_per_pass", true);
@@ -1166,23 +1287,47 @@ void PassManager::run_passes(DexStoresVector& stores, ConfigFiles& conf) {
   // For core loop legibility, have a lambda here.
 
   auto pre_pass_verifiers = [&](Pass* pass, size_t i) {
-    if (i == 0 && assessor_config.run_initially) {
+    if (i == 0 && assessor_config->run_initially) {
       ::run_assessor(*this, scope, /* initially */ true);
     }
   };
 
   auto post_pass_verifiers = [&](Pass* pass, size_t i, size_t size) {
-    walk::parallel::code(build_class_scope(stores), [](DexMethod* m,
-                                                       IRCode& code) {
-      // Ensure that pass authors deconstructed the editable CFG at the end of
-      // their pass. Currently, passes assume the incoming code will be in
-      // IRCode form
-      always_assert_log(!code.editable_cfg_built(), "%s has a cfg!", SHOW(m));
+    ConcurrentSet<const DexMethodRef*> all_code_referenced_methods;
+    ConcurrentSet<DexMethod*> unique_methods;
+    bool is_editable_cfg_friendly = pass->is_editable_cfg_friendly();
+    walk::parallel::code(build_class_scope(stores), [&](DexMethod* m,
+                                                        IRCode& code) {
+      if (is_editable_cfg_friendly) {
+        always_assert_log(code.editable_cfg_built(), "%s has a cfg!", SHOW(m));
+      }
+      if (slow_invariants_debug) {
+        std::vector<DexMethodRef*> methods;
+        methods.reserve(1000);
+        methods.push_back(m);
+        code.gather_methods(methods);
+        for (auto* mref : methods) {
+          always_assert_log(
+              DexMethod::get_method(mref->get_class(), mref->get_name(),
+                                    mref->get_proto()) != nullptr,
+              "Did not find %s in the context, referenced from %s!", SHOW(mref),
+              SHOW(m));
+          all_code_referenced_methods.insert(mref);
+        }
+        if (!unique_methods.insert(m)) {
+          not_reached_log("Duplicate method: %s", SHOW(m));
+        }
+      }
     });
+    if (slow_invariants_debug) {
+      ScopedMetrics sm(*this);
+      sm.set_metric("num_code_referenced_methods",
+                    all_code_referenced_methods.size());
+    }
 
     bool run_hasher = run_hasher_after_each_pass;
-    bool run_assessor = assessor_config.run_after_each_pass ||
-                        (assessor_config.run_finally && i == size - 1);
+    bool run_assessor = assessor_config->run_after_each_pass ||
+                        (assessor_config->run_finally && i == size - 1);
     bool run_type_checker = checker_conf.run_after_pass(pass);
 
     if (run_hasher || run_assessor || run_type_checker ||
@@ -1216,6 +1361,8 @@ void PassManager::run_passes(DexStoresVector& stores, ConfigFiles& conf) {
   JNINativeContextHelper jni_native_context_helper(
       scope, m_redex_options.jni_summary_path);
 
+  JemallocStats jemalloc_stats{this, conf};
+
   std::unordered_map<const Pass*, size_t> runs;
 
   /////////////////////
@@ -1228,7 +1375,7 @@ void PassManager::run_passes(DexStoresVector& stores, ConfigFiles& conf) {
     analysis_usage_helper.pre_pass(pass);
 
     TRACE(PM, 1, "Running %s...", pass->name().c_str());
-    ScopedVmHWM vm_hwm{hwm_pass_stats, hwm_per_pass};
+    ScopedMemStats scoped_mem_stats{mem_pass_stats, hwm_per_pass};
     Timer t(pass->name() + " " + std::to_string(pass_run) + " (run)");
     m_current_pass_info = &m_pass_info[i];
 
@@ -1242,11 +1389,43 @@ void PassManager::run_passes(DexStoresVector& stores, ConfigFiles& conf) {
       auto scoped_command_all_prof = ScopedCommandProfiling::maybe_from_info(
           profiler_all_info, &pass->name());
       jemalloc_util::ScopedProfiling malloc_prof(m_malloc_profile_pass == pass);
+      auto maybe_track_violations =
+          violatios_tracking.maybe_track(this, stores);
+      if (!pass->is_editable_cfg_friendly()) {
+        // if this pass hasn't been updated to editable_cfg yet, clear_cfg. In
+        // the future, once all editable cfg updates are done, this branch will
+        // be removed.
+        auto temp_scope = build_class_scope(stores);
+        walk::parallel::code(
+            temp_scope, [&](DexMethod*, IRCode& code) { code.clear_cfg(); });
+        TRACE(PM, 2, "%s Pass has not been updated to editable cfg.\n",
+              SHOW(pass->name()));
+      } else {
+        // Run build_cfg() in case any newly added methods by previous passes
+        // are not built as editable cfg. But if editable cfg is already built,
+        // no need to rebuild it.
+        ensure_editable_cfg(stores);
+        TRACE(PM, 2, "%s Pass uses editable cfg.\n", SHOW(pass->name()));
+      }
       pass->run_pass(stores, conf, *this);
+
+      // Ensure the CFG is clean, e.g., no unreachable blocks.
+      if (pass->is_editable_cfg_friendly()) {
+        auto temp_scope = build_class_scope(stores);
+        walk::parallel::code(temp_scope, [&](DexMethod* method, IRCode& code) {
+          always_assert_log(code.editable_cfg_built(),
+                            "%s has no editable cfg after cfg-friendly pass %s",
+                            SHOW(method), pass->name().c_str());
+          code.cfg().simplify();
+        });
+      }
+
       trace_cls.dump(pass->name());
     }
 
-    vm_hwm.trace_log(this, pass);
+    scoped_mem_stats.trace_log(this, pass);
+
+    jemalloc_stats.process_jemalloc_stats_for_pass(pass, pass_run);
 
     sanitizers::lsan_do_recoverable_leak_check();
 
@@ -1257,6 +1436,7 @@ void PassManager::run_passes(DexStoresVector& stores, ConfigFiles& conf) {
     analysis_usage_helper.post_pass(pass);
 
     process_method_profiles(*this, conf);
+    process_secondary_method_profiles(*this, conf);
 
     if (after_pass_size.handle(m_current_pass_info, &stores, &conf)) {
       // Measuring child. Return to write things out.
@@ -1268,8 +1448,12 @@ void PassManager::run_passes(DexStoresVector& stores, ConfigFiles& conf) {
 
   after_pass_size.wait();
 
-  // Always run the type checker before generating the optimized dex code.
+  // Always clear cfg and run the type checker before generating the optimized
+  // dex code.
   scope = build_class_scope(it);
+  walk::parallel::code(scope,
+                       [&](DexMethod*, IRCode& code) { code.clear_cfg(); });
+  TRACE(PM, 1, "All opt passes are done, clear cfg\n");
   checker_conf.check_no_overwrite_this(get_redex_options().no_overwrite_this())
       .validate_access(true)
       .run_verifier(scope);
@@ -1289,24 +1473,55 @@ void PassManager::run_passes(DexStoresVector& stores, ConfigFiles& conf) {
   Timer::add_timer("PassManager.CheckUniqueDeobfuscateds",
                    m_check_unique_deobfuscateds_timer.get_seconds());
   Timer::add_timer("CFGMutation", cfg::CFGMutation::get_seconds());
+  Timer::add_timer(
+      "MethodProfiles::process_unresolved_lines",
+      method_profiles::MethodProfiles::get_process_unresolved_lines_seconds());
+  Timer::add_timer("compute_locations_closure_wto",
+                   get_compute_locations_closure_wto_seconds());
+  Timer::add_timer("cc_impl::destructor_second",
+                   cc_impl::get_destructor_seconds());
 }
 
 void PassManager::activate_pass(const std::string& name,
+                                const std::string* alias,
                                 const Json::Value& conf) {
   // Names may or may not have a "#<id>" suffix to indicate their order in the
   // pass list, which needs to be removed for matching.
-  std::string pass_name = name.substr(0, name.find('#'));
-  for (auto pass : m_registered_passes) {
-    if (pass_name == pass->name()) {
-      m_activated_passes.push_back(pass);
+  auto activate = [this, &conf](const std::string& n, const std::string* a) {
+    for (auto pass : m_registered_passes) {
+      if (n == pass->name()) {
+        if (a != nullptr) {
+          auto cloned_pass = pass->clone(*a);
+          always_assert_log(cloned_pass != nullptr,
+                            "Cannot clone pass %s to make alias %s", n.c_str(),
+                            a->c_str());
+          pass = cloned_pass.get();
+          m_cloned_passes.emplace_back(std::move(cloned_pass));
+        }
 
-      // Retrieving the configuration specific to this particular run
-      // of the pass.
-      pass->parse_config(JsonWrapper(conf[name]));
-      return;
+        m_activated_passes.push_back(pass);
+
+        // Retrieving the configuration specific to this particular run
+        // of the pass.
+        pass->parse_config(JsonWrapper(conf[a == nullptr ? n : *a]));
+        return true;
+      }
     }
+    return false;
+  };
+
+  // Does a pass exist with this name (directly)?
+  if (activate(name, nullptr)) {
+    return;
   }
-  not_reached_log("No pass named %s!", name.c_str());
+
+  // Can we find it under the given alias?
+  if (alias != nullptr && activate(*alias, &name)) {
+    return;
+  }
+
+  not_reached_log("No pass named %s(%s)!", name.c_str(),
+                  alias != nullptr ? alias->c_str() : "n/a");
 }
 
 Pass* PassManager::find_pass(const std::string& pass_name) const {
@@ -1319,15 +1534,18 @@ Pass* PassManager::find_pass(const std::string& pass_name) const {
 
 void PassManager::incr_metric(const std::string& key, int64_t value) {
   always_assert_log(m_current_pass_info != nullptr, "No current pass!");
+  std::unique_lock<std::mutex> lock{m_internal_fields->m_metrics_lock};
   (m_current_pass_info->metrics)[key] += value;
 }
 
 void PassManager::set_metric(const std::string& key, int64_t value) {
   always_assert_log(m_current_pass_info != nullptr, "No current pass!");
+  std::unique_lock<std::mutex> lock{m_internal_fields->m_metrics_lock};
   (m_current_pass_info->metrics)[key] = value;
 }
 
 int64_t PassManager::get_metric(const std::string& key) {
+  std::unique_lock<std::mutex> lock{m_internal_fields->m_metrics_lock};
   return (m_current_pass_info->metrics)[key];
 }
 

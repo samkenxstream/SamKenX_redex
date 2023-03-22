@@ -9,6 +9,7 @@
 
 #include "ControlFlow.h"
 #include "EditableCfgAdapter.h"
+#include "RedexContext.h"
 #include "Resolver.h"
 #include "TypeUtil.h"
 
@@ -16,6 +17,7 @@ namespace {
 
 class ClInitSideEffectsAnalysis {
  private:
+  bool m_allow_benign_method_invocations;
   const method::ClInitHasNoSideEffectsPredicate* m_clinit_has_no_side_effects;
   const std::unordered_set<DexMethod*>* m_non_true_virtuals;
   std::unordered_set<DexMethodRef*> m_active;
@@ -23,9 +25,11 @@ class ClInitSideEffectsAnalysis {
 
  public:
   explicit ClInitSideEffectsAnalysis(
+      bool allow_benign_method_invocations,
       const method::ClInitHasNoSideEffectsPredicate* clinit_has_no_side_effects,
       const std::unordered_set<DexMethod*>* non_true_virtuals)
-      : m_clinit_has_no_side_effects(clinit_has_no_side_effects),
+      : m_allow_benign_method_invocations(allow_benign_method_invocations),
+        m_clinit_has_no_side_effects(clinit_has_no_side_effects),
         m_non_true_virtuals(non_true_virtuals) {}
 
   const DexClass* run(const DexClass* cls) {
@@ -87,7 +91,8 @@ class ClInitSideEffectsAnalysis {
   bool invoke_may_have_side_effects(DexMethod* effective_caller,
                                     IRInstruction* insn) {
     auto method_ref = insn->get_method();
-    if (method::is_clinit_invoked_method_benign(method_ref)) {
+    if (m_allow_benign_method_invocations &&
+        method::is_clinit_invoked_method_benign(method_ref)) {
       return false;
     }
     if (opcode::is_invoke_interface(insn->opcode()) ||
@@ -168,6 +173,10 @@ bool is_clinit(const DexMethodRef* method) {
   return strcmp(method->get_name()->c_str(), "<clinit>") == 0;
 }
 
+bool is_argless_init(const DexMethodRef* method) {
+  return is_init(method) && method->get_proto()->get_args()->empty();
+}
+
 bool is_trivial_clinit(const IRCode& code) {
   always_assert(!code.editable_cfg_built());
   auto ii = InstructionIterable(code);
@@ -177,19 +186,17 @@ bool is_trivial_clinit(const IRCode& code) {
 }
 
 bool is_clinit_invoked_method_benign(const DexMethodRef* method_ref) {
-  const auto& type_name = method_ref->get_class()->str();
-  if (strcmp(type_name.c_str(), "Lcom/redex/OutlinedStringBuilders;") == 0) {
+  const auto type_name = method_ref->get_class()->str();
+  if (type_name == "Lcom/redex/OutlinedStringBuilders;") {
     return true;
   }
 
-  const auto& name = method_ref->get_name()->str();
-  if (strcmp(name.c_str(), "clone") == 0 ||
-      strcmp(name.c_str(), "concat") == 0 ||
-      strcmp(name.c_str(), "append") == 0) {
+  const auto name = method_ref->get_name()->str();
+  if (name == "clone" || name == "concat" || name == "append") {
     return true;
   }
 
-  static const std::unordered_set<std::string> methods = {
+  static const std::unordered_set<std::string_view> methods = {
       // clang-format off
       "Landroid/content/Context;.getApplicationContext:()Landroid/content/Context;",
       "Landroid/content/Context;.getApplicationInfo:()Landroid/content/pm/ApplicationInfo;",
@@ -480,59 +487,36 @@ bool is_clinit_invoked_method_benign(const DexMethodRef* method_ref) {
 
 const DexClass* clinit_may_have_side_effects(
     const DexClass* cls,
+    bool allow_benign_method_invocations,
     const ClInitHasNoSideEffectsPredicate* clinit_has_no_side_effects,
     const std::unordered_set<DexMethod*>* non_true_virtuals) {
-  ClInitSideEffectsAnalysis analysis(clinit_has_no_side_effects,
+  ClInitSideEffectsAnalysis analysis(allow_benign_method_invocations,
+                                     clinit_has_no_side_effects,
                                      non_true_virtuals);
   return analysis.run(cls);
 }
 
 bool no_invoke_super(const IRCode& code) {
-  always_assert(!code.editable_cfg_built());
-  for (const auto& mie : InstructionIterable(code)) {
+  bool has_invoke_super{false};
+  editable_cfg_adapter::iterate(&code, [&](const MethodItemEntry& mie) {
     auto insn = mie.insn;
     if (insn->opcode() == OPCODE_INVOKE_SUPER) {
-      return false;
+      has_invoke_super = true;
+      return editable_cfg_adapter::LOOP_BREAK;
     }
+    return editable_cfg_adapter::LOOP_CONTINUE;
+  });
+  return !has_invoke_super;
+}
+
+#define DEFINE_CACHED_METHOD(func_name, _)                 \
+  DexMethod* func_name() {                                 \
+    return g_redex->pointers_cache().method_##func_name(); \
   }
 
-  return true;
-}
-
-DexMethod* java_lang_Object_ctor() {
-  return static_cast<DexMethod*>(
-      DexMethod::make_method("Ljava/lang/Object;.<init>:()V"));
-}
-
-DexMethod* java_lang_Enum_ctor() {
-  return static_cast<DexMethod*>(
-      DexMethod::make_method("Ljava/lang/Enum;.<init>:(Ljava/lang/String;I)V"));
-}
-
-DexMethod* java_lang_Enum_ordinal() {
-  return static_cast<DexMethod*>(
-      DexMethod::make_method("Ljava/lang/Enum;.ordinal:()I"));
-}
-
-DexMethod* java_lang_Enum_name() {
-  return static_cast<DexMethod*>(
-      DexMethod::make_method("Ljava/lang/Enum;.name:()Ljava/lang/String;"));
-}
-
-DexMethod* java_lang_Enum_equals() {
-  return static_cast<DexMethod*>(
-      DexMethod::make_method("Ljava/lang/Enum;.equals:(Ljava/lang/Object;)Z"));
-}
-
-DexMethod* java_lang_Integer_valueOf() {
-  return static_cast<DexMethod*>(DexMethod::make_method(
-      "Ljava/lang/Integer;.valueOf:(I)Ljava/lang/Integer;"));
-}
-
-DexMethod* java_lang_Integer_intValue() {
-  return static_cast<DexMethod*>(
-      DexMethod::make_method("Ljava/lang/Integer;.intValue:()I"));
-}
+#define FOR_EACH DEFINE_CACHED_METHOD
+WELL_KNOWN_METHODS
+#undef FOR_EACH
 
 DexMethod* kotlin_jvm_internal_Intrinsics_checkParameterIsNotNull() {
   return static_cast<DexMethod*>(DexMethod::get_method(

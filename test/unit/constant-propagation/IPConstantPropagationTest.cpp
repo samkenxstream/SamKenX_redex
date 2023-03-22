@@ -30,7 +30,7 @@ struct InterproceduralConstantPropagationTest : public RedexTest {
   InterproceduralConstantPropagationTest() {
     // Calling get_vmethods under the hood initializes the object-class, which
     // we need in the tests to create a proper scope
-    get_vmethods(type::java_lang_Object());
+    virt_scope::get_vmethods(type::java_lang_Object());
 
     auto object_ctor = static_cast<DexMethod*>(method::java_lang_Object_ctor());
     object_ctor->set_access(ACC_PUBLIC | ACC_CONSTRUCTOR);
@@ -454,23 +454,24 @@ TEST_F(InterproceduralConstantPropagationTest, unreachableInvoke) {
   auto cls = creator.create();
   scope.push_back(cls);
 
-  call_graph::Graph cg = call_graph::single_callee_graph(
-      *method_override_graph::build_graph(scope), scope);
+  auto cg = std::make_shared<call_graph::Graph>(call_graph::single_callee_graph(
+      *method_override_graph::build_graph(scope), scope));
   walk::code(scope, [](DexMethod*, IRCode& code) {
     code.build_cfg(/* editable */ false);
   });
-  FixpointIterator fp_iter(
-      cg,
-      [](const DexMethod* method,
-         const WholeProgramState&,
-         const ArgumentDomain& args) {
-        auto& code = *method->get_code();
-        auto env = env_with_params(is_static(method), &code, args);
-        auto intra_cp = std::make_unique<intraprocedural::FixpointIterator>(
-            code.cfg(), ConstantPrimitiveAnalyzer());
-        intra_cp->run(env);
-        return intra_cp;
-      });
+  FixpointIterator fp_iter(std::move(cg),
+                           [](const DexMethod* method,
+                              const WholeProgramState&,
+                              const ArgumentDomain& args) {
+                             auto& code = *method->get_code();
+                             auto env = env_with_params(
+                                 is_static(method), &code, args);
+                             return std::make_unique<IntraproceduralAnalysis>(
+                                 /* wps accessor */ nullptr,
+                                 code.cfg(),
+                                 ConstantPrimitiveAnalyzer(),
+                                 std::move(env));
+                           });
 
   fp_iter.run({{CURRENT_PARTITION_LABEL, ArgumentDomain()}});
 
@@ -1924,6 +1925,72 @@ TEST_F(InterproceduralConstantPropagationTest,
       (load-param-object v0)
       (invoke-direct (v0) "Ljava/lang/Object;.<init>:()V")
       (sput-object v0 "LFoo;.some_global_field:LFoo;") ; 'this' escapes here
+      (const v1 42)
+      (iput v1 v0 "LFoo;.f:I")
+      (return-void)
+     )
+    )
+  )");
+  init->rstate.set_root(); // Make this an entry point
+  creator.add_method(init);
+
+  auto m = assembler::method_from_string(R"(
+    (method (public static) "LFoo;.baz:(LFoo;)I"
+     (
+      (load-param-object v0)
+      (iget v0 "LFoo;.f:I")
+      (move-result-pseudo v0)
+      (return v0)
+     )
+    )
+  )");
+  m->rstate.set_root(); // Make this an entry point
+  creator.add_method(m);
+
+  Scope scope{creator.create()};
+  walk::code(scope, [](DexMethod*, IRCode& code) {
+    code.build_cfg(/* editable */ false);
+    code.cfg().calculate_exit_block();
+  });
+
+  InterproceduralConstantPropagationPass::Config config;
+  config.max_heap_analysis_iterations = 2;
+
+  auto fp_iter = InterproceduralConstantPropagationPass(config).analyze(
+      scope, &m_immut_analyzer_state, &m_api_level_analyzer_state);
+  auto& wps = fp_iter->get_whole_program_state();
+  // 0 is included in the numeric interval as 'this' escaped before the
+  // assignment
+  EXPECT_EQ(wps.get_field_value(field_f), SignedConstantDomain(0, 42));
+
+  InterproceduralConstantPropagationPass(config).run(make_simple_stores(scope));
+
+  auto expected_code = assembler::ircode_from_string(R"(
+    (
+      (load-param-object v0)
+      (iget v0 "LFoo;.f:I")
+      (move-result-pseudo v0)
+      (return v0)
+    )
+  )");
+
+  EXPECT_CODE_EQ(m->get_code(), expected_code.get());
+}
+
+TEST_F(InterproceduralConstantPropagationTest,
+       constantFieldAfterInit_nontrivial_external_base_ctor) {
+  auto cls_ty = DexType::make_type("LFoo;");
+  ClassCreator creator(cls_ty);
+  creator.set_super(type::java_lang_Throwable());
+
+  auto field_f = DexField::make_field("LFoo;.f:I")->make_concrete(ACC_PUBLIC);
+  creator.add_field(field_f);
+
+  auto init = assembler::method_from_string(R"(
+    (method (public constructor) "LFoo;.<init>:()V"
+     (
+      (load-param-object v0)
+      (invoke-direct (v0) "Ljava/lang/Throwable;.<init>:()V") ; 'this' escapes here
       (const v1 42)
       (iput v1 v0 "LFoo;.f:I")
       (return-void)

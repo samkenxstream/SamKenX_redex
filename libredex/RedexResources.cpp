@@ -7,6 +7,7 @@
 
 #include "RedexResources.h"
 
+#include <boost/algorithm/string.hpp>
 #include <boost/filesystem.hpp>
 #include <boost/filesystem/operations.hpp>
 #include <map>
@@ -21,6 +22,7 @@
 #include "Debug.h"
 #include "DetectBundle.h"
 #include "DexUtil.h"
+#include "GlobalConfig.h"
 #include "IOUtil.h"
 #include "Macros.h"
 #include "ReadMaybeMapped.h"
@@ -145,7 +147,7 @@ std::unordered_set<std::string> get_files_by_suffix(
       const path_t& entry_path = entry.path();
 
       if (is_regular_file(entry_path) &&
-          ends_with(entry_path.string().c_str(), suffix.c_str())) {
+          boost::ends_with(entry_path.string(), suffix)) {
         files.emplace(entry_path.string());
       }
 
@@ -198,9 +200,19 @@ void find_resource_xml_files(const std::string& dir,
              ++lit) {
           const path_t& resource_path = lit->path();
           if (is_regular_file(resource_path) &&
-              ends_with(resource_path.string().c_str(), ".xml")) {
+              boost::ends_with(resource_path.string(), ".xml")) {
             handler(resource_path.string());
           }
+        }
+      } else {
+        // In case input APK has resource file path changed and not in usual
+        // format.
+        // TODO(T126661220): this disabled performance improvement to read less
+        // resource files, it would be better if we have mapping file to map
+        // back resource file names.
+        if (is_regular_file(entry_path) &&
+            boost::ends_with(entry_path.string(), ".xml")) {
+          handler(entry_path.string());
         }
       }
     }
@@ -284,6 +296,39 @@ void AndroidResources::collect_layout_classes_and_attributes(
   }
 }
 
+void AndroidResources::collect_xml_attribute_string_values(
+    std::unordered_set<std::string>* out) {
+  std::mutex out_mutex;
+  workqueue_run<std::string>(
+      [&](sparta::SpartaWorkerState<std::string>* worker_state,
+          const std::string& input) {
+        if (input.empty()) {
+          // Dispatcher, find files and create tasks.
+          auto directories = find_res_directories();
+          for (const auto& dir : directories) {
+            TRACE(RES, 9, "Scanning %s for xml files for attribute values",
+                  dir.c_str());
+            find_resource_xml_files(dir, {}, [&](const std::string& file) {
+              worker_state->push_task(file);
+            });
+          }
+
+          return;
+        }
+
+        std::unordered_set<std::string> local_out_values;
+        collect_xml_attribute_string_values_for_file(input, &local_out_values);
+        if (!local_out_values.empty()) {
+          std::unique_lock<std::mutex> lock(out_mutex);
+          // C++17: use merge to avoid copies.
+          out->insert(local_out_values.begin(), local_out_values.end());
+        }
+      },
+      std::vector<std::string>{""},
+      std::min(redex_parallel::default_num_threads(), kReadXMLThreads),
+      /*push_tasks_while_running=*/true);
+}
+
 void AndroidResources::rename_classes_in_layouts(
     const std::map<std::string, std::string>& rename_map) {
   workqueue_run<std::string>(
@@ -340,8 +385,7 @@ void find_native_library_files(const std::string& lib_root, Fn handler) {
       auto const& entry = *it;
       const path_t& entry_path = entry.path();
       if (is_regular_file(entry_path) &&
-          ends_with(entry_path.filename().string().c_str(),
-                    library_extension.c_str())) {
+          boost::ends_with(entry_path.filename().string(), library_extension)) {
         TRACE(RES, 9, "Checking lib: %s", entry_path.string().c_str());
         handler(entry_path.string());
       }
@@ -393,7 +437,19 @@ std::unordered_set<std::string> AndroidResources::get_native_classes() {
   return all_classes;
 }
 
-void ResourceTableFile::remove_unreferenced_strings() {
+bool AndroidResources::can_obfuscate_xml_file(
+    const std::unordered_set<std::string>& allowed_types,
+    const std::string& dirname) {
+  for (const auto& type : allowed_types) {
+    auto path = RES_DIRECTORY + std::string("/") + type;
+    if (dirname.find(path) != std::string::npos) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void ResourceTableFile::finalize_resource_table(const ResourceConfig& config) {
   // Intentionally left empty, proto resource table will not contain a relevant
-  // structure to prune.
+  // structure to clean up.
 }

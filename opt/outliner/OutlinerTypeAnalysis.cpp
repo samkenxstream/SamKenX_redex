@@ -71,32 +71,32 @@ const DexType* OutlinerTypeAnalysis::get_inferred_type(
   auto insn = pc.root.insns.front();
   const auto& env = m_type_environments->at(insn);
   switch (env.get_type(reg).element()) {
-  case BOTTOM:
-  case ZERO:
-  case CONST:
-  case CONST1:
-  case SCALAR:
-  case SCALAR1:
+  case IRType::BOTTOM:
+  case IRType::ZERO:
+  case IRType::CONST:
+  case IRType::CONST1:
+  case IRType::SCALAR:
+  case IRType::SCALAR1:
     // Can't figure out exact type via type inference; let's try reaching-defs
     return get_type_of_reaching_defs(nullptr, insn, reg);
-  case REFERENCE: {
+  case IRType::REFERENCE: {
     auto dex_type = env.get_dex_type(reg);
     return dex_type ? *dex_type : nullptr;
   }
-  case INT:
+  case IRType::INT:
     // Could actually be boolean, byte, short; let's try reaching-defs
     return get_type_of_reaching_defs(nullptr, insn, reg);
-  case FLOAT:
+  case IRType::FLOAT:
     return type::_float();
-  case LONG1:
+  case IRType::LONG1:
     return type::_long();
-  case DOUBLE1:
+  case IRType::DOUBLE1:
     return type::_double();
-  case CONST2:
-  case DOUBLE2:
-  case LONG2:
-  case SCALAR2:
-  case TOP:
+  case IRType::CONST2:
+  case IRType::DOUBLE2:
+  case IRType::LONG2:
+  case IRType::SCALAR2:
+  case IRType::TOP:
   default:
     not_reached();
   }
@@ -191,12 +191,9 @@ const DexType* OutlinerTypeAnalysis::get_result_type_helper(
   case OPCODE_AND_INT:
   case OPCODE_OR_INT:
   case OPCODE_XOR_INT:
-  case OPCODE_AND_INT_LIT16:
-  case OPCODE_OR_INT_LIT16:
-  case OPCODE_XOR_INT_LIT16:
-  case OPCODE_AND_INT_LIT8:
-  case OPCODE_OR_INT_LIT8:
-  case OPCODE_XOR_INT_LIT8:
+  case OPCODE_AND_INT_LIT:
+  case OPCODE_OR_INT_LIT:
+  case OPCODE_XOR_INT_LIT:
     // These (must) get a special handling by caller
     not_reached();
 
@@ -281,15 +278,12 @@ const DexType* OutlinerTypeAnalysis::get_result_type_helper(
   case OPCODE_SHL_INT:
   case OPCODE_SHR_INT:
   case OPCODE_USHR_INT:
-  case OPCODE_ADD_INT_LIT16:
-  case OPCODE_RSUB_INT:
-  case OPCODE_MUL_INT_LIT16:
-  case OPCODE_ADD_INT_LIT8:
-  case OPCODE_RSUB_INT_LIT8:
-  case OPCODE_MUL_INT_LIT8:
-  case OPCODE_SHL_INT_LIT8:
-  case OPCODE_SHR_INT_LIT8:
-  case OPCODE_USHR_INT_LIT8:
+  case OPCODE_ADD_INT_LIT:
+  case OPCODE_RSUB_INT_LIT:
+  case OPCODE_MUL_INT_LIT:
+  case OPCODE_SHL_INT_LIT:
+  case OPCODE_SHR_INT_LIT:
+  case OPCODE_USHR_INT_LIT:
   case OPCODE_FLOAT_TO_INT:
   case OPCODE_DOUBLE_TO_INT:
   case OPCODE_LONG_TO_INT:
@@ -398,6 +392,8 @@ const DexType* OutlinerTypeAnalysis::get_result_type_helper(
 
   case OPCODE_INVOKE_CUSTOM:
   case OPCODE_INVOKE_POLYMORPHIC:
+  case OPCODE_CONST_METHOD_HANDLE:
+  case OPCODE_CONST_METHOD_TYPE:
     not_reached_log(
         "Unsupported instruction {%s} in "
         "get_result_type_helper\n",
@@ -405,10 +401,8 @@ const DexType* OutlinerTypeAnalysis::get_result_type_helper(
 
   case OPCODE_DIV_INT:
   case OPCODE_REM_INT:
-  case OPCODE_DIV_INT_LIT16:
-  case OPCODE_REM_INT_LIT16:
-  case OPCODE_DIV_INT_LIT8:
-  case OPCODE_REM_INT_LIT8:
+  case OPCODE_DIV_INT_LIT:
+  case OPCODE_REM_INT_LIT:
     return type::_int();
   case OPCODE_DIV_LONG:
   case OPCODE_REM_LONG:
@@ -434,11 +428,11 @@ const DexType* OutlinerTypeAnalysis::get_if_insn_type_demand(
   auto& env = m_type_environments->at(insn);
   for (size_t src_index = 0; src_index < insn->srcs_size(); src_index++) {
     auto t = env.get_type(insn->src(src_index));
-    if (t.element() == REFERENCE) {
+    if (t.element() == IRType::REFERENCE) {
       return type::java_lang_Object();
-    } else if (t.element() == FLOAT) {
+    } else if (t.element() == IRType::FLOAT) {
       return type::_float();
-    } else if (t.element() == INT) {
+    } else if (t.element() == IRType::INT) {
       return type::_int();
     }
   }
@@ -556,31 +550,23 @@ const DexType* OutlinerTypeAnalysis::get_type_demand(IRInstruction* insn,
   case OPCODE_USHR_INT:
   case OPCODE_DIV_INT:
   case OPCODE_REM_INT:
-  case OPCODE_ADD_INT_LIT16:
-  case OPCODE_RSUB_INT:
-  case OPCODE_MUL_INT_LIT16:
-  case OPCODE_ADD_INT_LIT8:
-  case OPCODE_RSUB_INT_LIT8:
-  case OPCODE_MUL_INT_LIT8:
-  case OPCODE_SHL_INT_LIT8:
-  case OPCODE_SHR_INT_LIT8:
-  case OPCODE_USHR_INT_LIT8:
-  case OPCODE_DIV_INT_LIT16:
-  case OPCODE_REM_INT_LIT16:
-  case OPCODE_DIV_INT_LIT8:
-  case OPCODE_REM_INT_LIT8:
+  case OPCODE_ADD_INT_LIT:
+  case OPCODE_RSUB_INT_LIT:
+  case OPCODE_MUL_INT_LIT:
+  case OPCODE_SHL_INT_LIT:
+  case OPCODE_SHR_INT_LIT:
+  case OPCODE_USHR_INT_LIT:
+  case OPCODE_DIV_INT_LIT:
+  case OPCODE_REM_INT_LIT:
     always_assert(src_index < 2);
     return type::_int();
 
   case OPCODE_AND_INT:
   case OPCODE_OR_INT:
   case OPCODE_XOR_INT:
-  case OPCODE_AND_INT_LIT16:
-  case OPCODE_OR_INT_LIT16:
-  case OPCODE_XOR_INT_LIT16:
-  case OPCODE_AND_INT_LIT8:
-  case OPCODE_OR_INT_LIT8:
-  case OPCODE_XOR_INT_LIT8:
+  case OPCODE_AND_INT_LIT:
+  case OPCODE_OR_INT_LIT:
+  case OPCODE_XOR_INT_LIT:
     always_assert(src_index < 2);
     // Note: These opcodes can preserve boolean-ness. The caller of this
     // method needs to track that.
@@ -741,6 +727,8 @@ const DexType* OutlinerTypeAnalysis::get_type_demand(IRInstruction* insn,
   }
   case OPCODE_INVOKE_CUSTOM:
   case OPCODE_INVOKE_POLYMORPHIC:
+  case OPCODE_CONST_METHOD_HANDLE:
+  case OPCODE_CONST_METHOD_TYPE:
     not_reached_log(
         "Unsupported instruction {%s} in "
         "get_type_demand\n",
@@ -796,12 +784,9 @@ void OutlinerTypeAnalysis::get_type_demand_helper(
         case OPCODE_AND_INT:
         case OPCODE_OR_INT:
         case OPCODE_XOR_INT:
-        case OPCODE_AND_INT_LIT16:
-        case OPCODE_OR_INT_LIT16:
-        case OPCODE_XOR_INT_LIT16:
-        case OPCODE_AND_INT_LIT8:
-        case OPCODE_OR_INT_LIT8:
-        case OPCODE_XOR_INT_LIT8:
+        case OPCODE_AND_INT_LIT:
+        case OPCODE_OR_INT_LIT:
+        case OPCODE_XOR_INT_LIT:
           if (!insn->has_literal() || insn->get_literal() == 0 ||
               insn->get_literal() == 1) {
             track_dest = true;
@@ -901,12 +886,9 @@ const DexType* OutlinerTypeAnalysis::get_const_insns_type_demand(
       case OPCODE_AND_INT:
       case OPCODE_OR_INT:
       case OPCODE_XOR_INT:
-      case OPCODE_AND_INT_LIT16:
-      case OPCODE_OR_INT_LIT16:
-      case OPCODE_XOR_INT_LIT16:
-      case OPCODE_AND_INT_LIT8:
-      case OPCODE_OR_INT_LIT8:
-      case OPCODE_XOR_INT_LIT8:
+      case OPCODE_AND_INT_LIT:
+      case OPCODE_OR_INT_LIT:
+      case OPCODE_XOR_INT_LIT:
         if (any_outside_range(const_insns, 0, 1)) {
           type_demands.insert(type::_int());
         } else {
@@ -1001,12 +983,9 @@ const DexType* OutlinerTypeAnalysis::get_type_of_defs(
       case OPCODE_AND_INT:
       case OPCODE_OR_INT:
       case OPCODE_XOR_INT:
-      case OPCODE_AND_INT_LIT16:
-      case OPCODE_OR_INT_LIT16:
-      case OPCODE_XOR_INT_LIT16:
-      case OPCODE_AND_INT_LIT8:
-      case OPCODE_OR_INT_LIT8:
-      case OPCODE_XOR_INT_LIT8:
+      case OPCODE_AND_INT_LIT:
+      case OPCODE_OR_INT_LIT:
+      case OPCODE_XOR_INT_LIT:
         if (def->has_literal() && def->get_literal() != 0 &&
             def->get_literal() != 1) {
           // Overall result cannot be a boolean (as far as the Android type

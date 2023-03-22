@@ -75,7 +75,6 @@
 
 #include <boost/format.hpp>
 
-#include "ABExperimentContext.h"
 #include "BigBlocks.h"
 #include "CFGMutation.h"
 #include "ConcurrentContainers.h"
@@ -95,6 +94,7 @@
 #include "Macros.h"
 #include "MethodProfiles.h"
 #include "MutablePriorityQueue.h"
+#include "ObfuscateUtils.h"
 #include "OutlinedMethods.h"
 #include "OutlinerTypeAnalysis.h"
 #include "OutliningProfileGuidanceImpl.h"
@@ -558,7 +558,7 @@ static bool ranges_overlap(const Ranges& a, const Ranges& b) {
   return false;
 }
 
-static bool can_outline_opcode(IROpcode opcode) {
+static bool can_outline_opcode(IROpcode opcode, bool outline_control_flow) {
   switch (opcode) {
   case IOPCODE_LOAD_PARAM:
   case IOPCODE_LOAD_PARAM_OBJECT:
@@ -587,6 +587,11 @@ static bool can_outline_opcode(IROpcode opcode) {
     return false;
 
   default:
+    if (!outline_control_flow && (opcode::is_a_conditional_branch(opcode) ||
+                                  opcode::is_switch(opcode))) {
+      return false;
+    }
+
     return true;
   }
 }
@@ -658,8 +663,9 @@ static bool append_to_partial_candidate(
 static bool can_outline_insn(const RefChecker& ref_checker,
                              const OptionalReachingInitializedsEnvironments&
                                  reaching_initialized_init_first_param,
-                             IRInstruction* insn) {
-  if (!can_outline_opcode(insn->opcode())) {
+                             IRInstruction* insn,
+                             bool outline_control_flow) {
+  if (!can_outline_opcode(insn->opcode(), outline_control_flow)) {
     return false;
   }
   if (insn->has_method()) {
@@ -827,7 +833,7 @@ static bool explore_candidates_from(
     auto insn = it->insn;
     if (pcn->insns.size() + 1 < MIN_INSNS_SIZE &&
         !can_outline_insn(ref_checker, reaching_initialized_init_first_param,
-                          insn)) {
+                          insn, config.outline_control_flow)) {
       return false;
     }
     cores_builder.push_back(insn);
@@ -1038,12 +1044,9 @@ static MethodCandidates find_method_candidates(
           std::vector<std::pair<reg_t, IRInstruction*>> live_out_consts;
           boost::optional<std::pair<reg_t, bool>> out_reg;
           if (!pc.root.defined_regs.empty()) {
-            LivenessDomain live_out;
-            if (next_block) {
-              live_out = liveness_fp_iter->get_live_in_vars_at(next_block);
-            } else {
-              live_out = live_outs[it.block()].at(it->insn);
-            }
+            const auto& live_out =
+                next_block ? liveness_fp_iter->get_live_in_vars_at(next_block)
+                           : live_outs[it.block()].at(it->insn);
             auto first_block_throw_live_out = throw_live_out[first_block];
             for (auto& p : pc.root.defined_regs) {
               if (first_block_throw_live_out.contains(p.first)) {
@@ -1241,8 +1244,9 @@ static void get_recurring_cores(
           CandidateInstructionCoresBuilder cores_builder;
           for (auto& mie : big_blocks::InstructionIterable(big_block)) {
             auto insn = mie.insn;
-            if (!can_outline_insn(
-                    ref_checker, reaching_initialized_init_first_param, insn)) {
+            if (!can_outline_insn(ref_checker,
+                                  reaching_initialized_init_first_param, insn,
+                                  config.outline_control_flow)) {
               cores_builder.clear();
               continue;
             }
@@ -1617,6 +1621,7 @@ class MethodNameGenerator {
   std::unordered_map<StableHash, size_t> m_unique_method_ids;
   size_t m_max_unique_method_id{0};
   size_t m_iteration;
+  size_t short_id_counter{0};
 
  public:
   MethodNameGenerator() = delete;
@@ -1627,13 +1632,23 @@ class MethodNameGenerator {
 
   // Compute the name of the outlined method in a way that tends to be stable
   // across Redex runs.
-  const DexString* get_name(const Candidate& c) {
+  // obfuscated_name argument allows to generate obfuscate name instead of names
+  // with a long hashed string, by default hashed names are returned.
+  const DexString* get_name(const Candidate& c, bool obfuscated_name = false) {
     StableHash stable_hash = stable_hash_value(c);
     auto unique_method_id = m_unique_method_ids[stable_hash]++;
     m_max_unique_method_id = std::max(m_max_unique_method_id, unique_method_id);
-    std::string name(OUTLINED_METHOD_NAME_PREFIX);
-    name += std::to_string(m_iteration) + "$";
-    name += (boost::format("%08x") % stable_hash).str();
+    std::string name;
+    if (obfuscated_name) {
+      name += OUTLINED_METHOD_SHORT_NAME_PREFIX;
+      std::string identifier_name;
+      obfuscate_utils::compute_identifier(short_id_counter++, &identifier_name);
+      name += identifier_name;
+    } else {
+      name += OUTLINED_METHOD_NAME_PREFIX;
+      name += std::to_string(m_iteration) + "$";
+      name += (boost::format("%08x") % stable_hash).str();
+    }
     if (unique_method_id > 0) {
       name += std::string("$") + std::to_string(unique_method_id);
       TRACE(ISO, 5,
@@ -1742,7 +1757,8 @@ class OutlinedMethodCreator {
                                     const CandidateInfo& ci,
                                     const DexType* host_class,
                                     std::set<uint32_t>* pattern_ids) {
-    auto name = m_method_name_generator.get_name(c);
+    auto name =
+        m_method_name_generator.get_name(c, m_config.obfuscate_method_names);
     DexTypeList::ContainerType arg_types;
     for (auto t : c.arg_types) {
       arg_types.push_back(const_cast<DexType*>(t));
@@ -2279,7 +2295,8 @@ class HostClassSelector {
             return false;
           }
           // We don't want any common base class with a scary clinit
-          return !method::clinit_may_have_side_effects(cls);
+          return !method::clinit_may_have_side_effects(
+              cls, /* allow_benign_method_invocations */ false);
         });
     if (host_class) {
       m_hosted_at_refs_count++;
@@ -2296,18 +2313,16 @@ using NewlyOutlinedMethods =
     std::unordered_map<DexMethod*, std::vector<DexMethod*>>;
 
 // Outlining all occurrences of a particular candidate.
-bool outline_candidate(
-    const Config& config,
-    const Candidate& c,
-    const CandidateInfo& ci,
-    ReusableOutlinedMethods* outlined_methods,
-    NewlyOutlinedMethods* newly_outlined_methods,
-    DexState* dex_state,
-    HostClassSelector* host_class_selector,
-    OutlinedMethodCreator* outlined_method_creator,
-    std::unique_ptr<ab_test::ABExperimentContext>& ab_experiment_context,
-    size_t* num_reused_methods,
-    bool reuse_outlined_methods_across_dexes) {
+bool outline_candidate(const Config& config,
+                       const Candidate& c,
+                       const CandidateInfo& ci,
+                       ReusableOutlinedMethods* outlined_methods,
+                       NewlyOutlinedMethods* newly_outlined_methods,
+                       DexState* dex_state,
+                       HostClassSelector* host_class_selector,
+                       OutlinedMethodCreator* outlined_method_creator,
+                       size_t* num_reused_methods,
+                       bool reuse_outlined_methods_across_dexes) {
   // Before attempting to create or reuse an outlined method that hasn't been
   // referenced in this dex before, we'll make sure that all the involved
   // type refs can be added to the dex. We collect those type refs.
@@ -2381,8 +2396,6 @@ bool outline_candidate(
     auto method = p.first;
     auto& cfg = method->get_code()->cfg();
 
-    ab_experiment_context->try_register_method(method);
-
     TRACE(ISO, 7, "[invoke sequence outliner] before outlined %s from %s\n%s",
           SHOW(outlined_method), SHOW(method), SHOW(cfg));
     for (auto& cml : p.second) {
@@ -2407,7 +2420,6 @@ static NewlyOutlinedMethods outline(
         candidate_ids_by_methods,
     ReusableOutlinedMethods* outlined_methods,
     size_t iteration,
-    std::unique_ptr<ab_test::ABExperimentContext>& ab_experiment_context,
     size_t* num_reused_methods) {
   MethodNameGenerator method_name_generator(mgr, iteration);
   OutlinedMethodCreator outlined_method_creator(config, mgr,
@@ -2473,7 +2485,7 @@ static NewlyOutlinedMethods outline(
     if (outline_candidate(config, cwi.candidate, cwi.info, outlined_methods,
                           &newly_outlined_methods, &dex_state,
                           &host_class_selector, &outlined_method_creator,
-                          ab_experiment_context, num_reused_methods,
+                          num_reused_methods,
                           config.reuse_outlined_methods_across_dexes)) {
       dex_state.insert_method_ref();
     } else {
@@ -2729,14 +2741,15 @@ static size_t clear_cfgs(const Scope& scope) {
 // reorder_all_methods
 ////////////////////////////////////////////////////////////////////////////////
 
+using OutlinedMethodsToReorder =
+    std::vector<std::pair<const Scope*, const NewlyOutlinedMethods>>;
 // helper function to reorder all the outlined methods
 // after all the dex files are processed.
 void reorder_all_methods(
     const Config& config,
     PassManager& mgr,
     const std::unordered_map<const DexMethodRef*, double>& methods_global_order,
-    const std::vector<std::pair<const Scope*, const NewlyOutlinedMethods>>&
-        outlined_methods_to_reorder) {
+    const OutlinedMethodsToReorder& outlined_methods_to_reorder) {
   for (auto& dex_methods_pair : outlined_methods_to_reorder) {
     auto& dex = dex_methods_pair.first;
     auto& outlined_methods = dex_methods_pair.second;
@@ -2942,6 +2955,52 @@ class OutlinedMethodBodySetter {
   }
 };
 
+////////////////////////////////////////////////////////////////////////////////
+// reorder_all_methods
+////////////////////////////////////////////////////////////////////////////////
+size_t update_method_profiles(
+    ConfigFiles& config,
+    const OutlinedMethodsToReorder& outlined_methods_to_reorder) {
+  // Outlined methods have rather unique method names of the form
+  //   $outlined$X$YYYYYYYY
+  // where X is 0 or 1 indicating whether the method was generated by the first
+  // or second outliner run, and YYYYYYYY is a stable hash that is derived from
+  // the outlined instruction sequence. While these names should be stable
+  // across builds and releases, the dex file and class any particular outlined
+  // method ends up in is not stable. To still reliably match outlined methods,
+  // we adjust the method profiles here accordingly based on the outlined method
+  // names.
+
+  auto& method_profiles = config.get_method_profiles();
+  std::unordered_map<std::string_view,
+                     std::vector<dex_member_refs::MethodDescriptorTokens>>
+      unresolved_names;
+  for (auto& mdt : method_profiles.get_unresolved_method_descriptor_tokens()) {
+    unresolved_names[mdt.name].push_back(mdt);
+  }
+  std::unordered_map<dex_member_refs::MethodDescriptorTokens,
+                     std::vector<DexMethodRef*>>
+      map;
+  size_t count{0};
+  for (auto& [dex, outlined_methods] : outlined_methods_to_reorder) {
+    for (auto&& [outlined_method, methods] : outlined_methods) {
+      auto name = outlined_method->get_name();
+      auto it = unresolved_names.find(name->str());
+      if (it == unresolved_names.end()) {
+        continue;
+      }
+      for (auto& mdt : it->second) {
+        map[mdt].push_back(outlined_method);
+        TRACE(ISO, 5, "[instruction sequence outliner] matched name %s with %s",
+              SHOW(name), SHOW(outlined_method));
+        count++;
+      }
+    }
+  }
+  method_profiles.resolve_method_descriptor_tokens(map);
+  return count;
+}
+
 } // namespace
 
 void InstructionSequenceOutliner::bind_config() {
@@ -2953,6 +3012,10 @@ void InstructionSequenceOutliner::bind_config() {
   bind("use_method_profiles", pg.use_method_profiles, pg.use_method_profiles,
        "Whether to use provided method-profiles configuration data to "
        "determine if certain code should not be outlined from a method");
+  bind("enable_hotness_propagation", pg.enable_hotness_propagation,
+       pg.enable_hotness_propagation,
+       "Whether to propagate method hotness (and warmness) to cold callees "
+       "if the call site blocks were executed.");
   bind("method_profiles_appear_percent",
        pg.method_profiles_appear_percent,
        pg.method_profiles_appear_percent,
@@ -2995,6 +3058,11 @@ void InstructionSequenceOutliner::bind_config() {
        m_config.debug_make_crashing,
        "Make outlined code crash, to harvest crashing stack traces involving "
        "outlined code.");
+  bind("obfuscate_method_names", m_config.obfuscate_method_names,
+       m_config.obfuscate_method_names,
+       "Whether to obfuscate generated method names for outlined methods, "
+       "instead of encoding a strong hash of their contents. Obfuscated names "
+       "tend to be shorter, but are less stable across builds.");
   after_configuration([=]() {
     always_assert(m_config.min_insns_size >= MIN_INSNS_SIZE);
     always_assert(m_config.max_insns_size >= m_config.min_insns_size);
@@ -3008,12 +3076,6 @@ void InstructionSequenceOutliner::bind_config() {
 void InstructionSequenceOutliner::run_pass(DexStoresVector& stores,
                                            ConfigFiles& config,
                                            PassManager& mgr) {
-  auto ab_experiment_context =
-      ab_test::ABExperimentContext::create("outliner_v1");
-  if (ab_experiment_context->use_control()) {
-    return;
-  }
-
   int32_t min_sdk = mgr.get_redex_options().min_sdk;
   mgr.incr_metric("min_sdk", min_sdk);
   TRACE(ISO, 2, "[invoke sequence outliner] min_sdk: %d", min_sdk);
@@ -3026,6 +3088,10 @@ void InstructionSequenceOutliner::run_pass(DexStoresVector& stores,
           min_sdk);
   } else {
     min_sdk_api = &config.get_android_sdk_api(min_sdk);
+  }
+
+  if (g_redex->instrument_mode) {
+    m_config.outline_control_flow = false;
   }
 
   auto scope = build_class_scope(stores);
@@ -3056,8 +3122,7 @@ void InstructionSequenceOutliner::run_pass(DexStoresVector& stores,
   ReusableOutlinedMethods outlined_methods;
   OutlinedMethodBodySetter outlined_method_body_setter(m_config, mgr);
   // keep track of the outlined methods and scope for reordering later
-  std::vector<std::pair<const Scope*, const NewlyOutlinedMethods>>
-      outlined_methods_to_reorder;
+  OutlinedMethodsToReorder outlined_methods_to_reorder;
   size_t num_reused_methods{0};
   boost::optional<size_t> last_store_idx;
   auto iteration = m_iteration++;
@@ -3113,7 +3178,7 @@ void InstructionSequenceOutliner::run_pass(DexStoresVector& stores,
       auto newly_outlined_methods =
           outline(m_config, mgr, dex_state, min_sdk, &candidates_with_infos,
                   &candidate_ids_by_methods, &outlined_methods, iteration,
-                  ab_experiment_context, &num_reused_methods);
+                  &num_reused_methods);
       outlined_methods_to_reorder.push_back({&dex, newly_outlined_methods});
       auto affected_methods = count_affected_methods(newly_outlined_methods);
       auto total_methods = clear_cfgs(dex);
@@ -3130,8 +3195,9 @@ void InstructionSequenceOutliner::run_pass(DexStoresVector& stores,
   outlined_method_body_setter.set_method_body(outlined_methods);
   reorder_all_methods(m_config, mgr, methods_global_order,
                       outlined_methods_to_reorder);
-
-  ab_experiment_context->flush();
+  size_t resolved_method_profiles =
+      update_method_profiles(config, outlined_methods_to_reorder);
+  mgr.incr_metric("num_resolved_method_profiles", resolved_method_profiles);
   mgr.incr_metric("num_reused_methods", num_reused_methods);
 }
 

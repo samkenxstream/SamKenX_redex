@@ -62,6 +62,8 @@
  * TODO?: make MethodItemEntry's fields private?
  */
 
+extern std::atomic<size_t> build_cfg_counter;
+
 namespace source_blocks {
 namespace impl {
 struct BlockAccessor;
@@ -274,6 +276,12 @@ class Block final {
   IRList::const_iterator end() const;
   IRList::reverse_iterator rbegin() { return IRList::reverse_iterator(end()); }
   IRList::reverse_iterator rend() { return IRList::reverse_iterator(begin()); }
+  IRList::const_reverse_iterator rbegin() const {
+    return IRList::const_reverse_iterator(end());
+  }
+  IRList::const_reverse_iterator rend() const {
+    return IRList::const_reverse_iterator(begin());
+  }
 
   bool is_catch() const;
 
@@ -692,6 +700,12 @@ class ControlFlowGraph {
   // `pred` and `succ` must be in the same try region
   void merge_blocks(Block* pred, Block* succ);
 
+  // Insert \p inserted_block between \p pred and \p succ, where there are only
+  // EDGE_GOTO or EDGE_BRANCH between \p pred and \p succ. After insertion, all
+  // edges from \p pred to \p succ will be redirected to \p inserted_block, and
+  // there will be a GOTO edge added from inserted_block to succ.
+  void insert_block(Block* pred, Block* succ, Block* inserted_block);
+
   // remove the IRInstruction that `it` points to.
   //
   // If `it` points to a branch instruction, remove the corresponding outgoing
@@ -963,7 +977,7 @@ class ControlFlowGraph {
    * Set whether this cfg holds the memory ownership of instructions that are
    * removed. (The default is true.)
    */
-  void set_removed_insn_ownerhsip(bool owns_removed_insns) {
+  void set_removed_insn_ownership(bool owns_removed_insns) {
     m_owns_removed_insns = owns_removed_insns;
   }
 
@@ -1266,10 +1280,11 @@ class GraphInterface {
   static NodeId exit(const Graph& graph) {
     return const_cast<NodeId>(graph.exit_block());
   }
-  static std::vector<EdgeId> predecessors(const Graph&, const NodeId& b) {
+  static const std::vector<EdgeId>& predecessors(const Graph&,
+                                                 const NodeId& b) {
     return b->preds();
   }
-  static std::vector<EdgeId> successors(const Graph&, const NodeId& b) {
+  static const std::vector<EdgeId>& successors(const Graph&, const NodeId& b) {
     return b->succs();
   }
   static NodeId source(const Graph&, const EdgeId& e) { return e->src(); }
@@ -1357,8 +1372,13 @@ class InstructionIteratorImpl {
   InstructionIteratorImpl(const InstructionIteratorImpl<false>& rhs)
       : m_cfg(rhs.m_cfg), m_block(rhs.m_block), m_it(rhs.m_it) {}
 
-  InstructionIteratorImpl& operator=(const InstructionIteratorImpl& other) =
-      default;
+  InstructionIteratorImpl& operator=(
+      const InstructionIteratorImpl<false>& rhs) {
+    m_cfg = rhs.m_cfg;
+    m_block = rhs.m_block;
+    m_it = rhs.m_it;
+    return *this;
+  }
 
   InstructionIteratorImpl<is_const>& operator++() {
     assert_not_end();
@@ -1427,6 +1447,18 @@ class InstructionIteratorImpl {
   bool is_end() const {
     return m_block == m_cfg->m_blocks.end() &&
            m_it == ir_list::InstructionIteratorImpl<is_const>();
+  }
+
+  // \returns true if current iterator is at the end of current block.
+  bool is_end_in_block() const {
+    return m_it.unwrap() == m_block->second->m_entries.end();
+  }
+
+  // Move the current iterator and this move must be in the same block.
+  InstructionIteratorImpl<is_const>& move_next_in_block() {
+    always_assert(!is_end_in_block());
+    ++m_it;
+    return *this;
   }
 
   Iterator unwrap() const { return m_it.unwrap(); }

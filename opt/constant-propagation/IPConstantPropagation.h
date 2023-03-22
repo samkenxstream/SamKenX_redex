@@ -12,6 +12,7 @@
 #include "ConstantPropagationRuntimeAssert.h"
 #include "ConstantPropagationTransform.h"
 #include "ConstantPropagationWholeProgramState.h"
+#include "IPConstantPropagationAnalysis.h"
 #include "Pass.h"
 
 namespace constant_propagation {
@@ -31,8 +32,6 @@ class PassImpl : public Pass {
     uint32_t big_override_threshold{5};
     std::unordered_set<const DexType*> field_blocklist;
     bool compute_definitely_assigned_ifields{true};
-    std::unordered_set<const DexType*>
-        definitely_assigned_ifields_basetype_blocklist;
 
     Transform::Config transform;
     RuntimeAssertTransform::Config runtime_assert;
@@ -67,11 +66,6 @@ class PassImpl : public Pass {
          m_config.compute_definitely_assigned_ifields,
          "Whether to predict which instance fields are always written before "
          "they are read, in order to ignore the default value 0.");
-    bind("definitely_assigned_ifields_basetype_blocklist",
-         {},
-         m_config.definitely_assigned_ifields_basetype_blocklist,
-         "List of external base classes whose constructors may invoke "
-         "overridable virtual methods.");
   }
 
   void run_pass(DexStoresVector& stores,
@@ -118,6 +112,8 @@ class PassImpl : public Pass {
     size_t callgraph_nodes{0};
     size_t callgraph_edges{0};
     size_t callgraph_callsites{0};
+
+    FixpointIterator::Stats fp_iter;
   } m_stats;
   Transform::Stats m_transform_stats;
   Config m_config;

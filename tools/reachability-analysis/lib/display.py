@@ -6,7 +6,7 @@
 import enum
 import html
 
-from IPython.core.display import HTML, display
+from IPython.core.display import display, HTML
 
 
 def phabricator_link(node):
@@ -47,7 +47,7 @@ def inject_scripts():
 
 def display_retainers(retainers):
     html = ["<p>"]
-    for retaining_nodes, retained_nodes in retainers.items():
+    for retaining_nodes, retained_nodes in list(retainers.items()):
         for node in retaining_nodes:
             html.append("{}".format(render_node(node)))
         html.append("<ul>")

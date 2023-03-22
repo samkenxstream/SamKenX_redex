@@ -131,20 +131,16 @@ class HashedAbstractEnvironment final
 
   HashedAbstractEnvironment& set(const Variable& variable,
                                  const Domain& value) {
-    if (this->is_bottom()) {
-      return *this;
-    }
-    if (value.is_bottom()) {
-      this->set_to_bottom();
-      return *this;
-    }
-    this->get_value()->insert_binding(variable, value);
-    this->normalize();
-    return *this;
+    return set_internal(variable, value);
   }
 
+  HashedAbstractEnvironment& set(const Variable& variable, Domain&& value) {
+    return set_internal(variable, std::move(value));
+  }
+
+  template <typename Operation> // void (Domain*)
   HashedAbstractEnvironment& update(const Variable& variable,
-                                    std::function<void(Domain*)> operation) {
+                                    Operation&& operation) {
     if (this->is_bottom()) {
       return *this;
     }
@@ -179,6 +175,21 @@ class HashedAbstractEnvironment final
 
   static HashedAbstractEnvironment top() {
     return HashedAbstractEnvironment(AbstractValueKind::Top);
+  }
+
+ private:
+  template <typename D>
+  HashedAbstractEnvironment& set_internal(const Variable& variable, D&& value) {
+    if (this->is_bottom()) {
+      return *this;
+    }
+    if (value.is_bottom()) {
+      this->set_to_bottom();
+      return *this;
+    }
+    this->get_value()->insert_binding(variable, std::forward<D>(value));
+    this->normalize();
+    return *this;
   }
 };
 
@@ -246,8 +257,8 @@ class MapValue final
  public:
   MapValue() = default;
 
-  MapValue(const Variable& variable, const Domain& value) {
-    insert_binding(variable, value);
+  MapValue(const Variable& variable, Domain value) {
+    insert_binding(variable, std::move(value));
   }
 
   void clear() override { m_map.clear(); }
@@ -326,7 +337,8 @@ class MapValue final
   }
 
  private:
-  void insert_binding(const Variable& variable, const Domain& value) {
+  template <typename D>
+  void insert_binding(const Variable& variable, D&& value) {
     // The Bottom value is handled in HashedAbstractEnvironment and should
     // never occur here.
     RUNTIME_CHECK(!value.is_bottom(), internal_error());
@@ -334,13 +346,13 @@ class MapValue final
       // Bindings with the Top value are not explicitly represented.
       m_map.erase(variable);
     } else {
-      m_map[variable] = value;
+      m_map.insert_or_assign(variable, std::forward<D>(value));
     }
   }
 
-  AbstractValueKind join_like_operation(
-      const MapValue& other,
-      std::function<void(Domain*, const Domain&)> operation) {
+  template <typename Operation> // void(Domain*, const Domain&)
+  AbstractValueKind join_like_operation(const MapValue& other,
+                                        Operation&& operation) {
     for (auto it = m_map.begin(); it != m_map.end();) {
       auto other_binding = other.m_map.find(it->first);
       if (other_binding == other.m_map.end()) {
@@ -364,9 +376,9 @@ class MapValue final
     return kind();
   }
 
-  AbstractValueKind meet_like_operation(
-      const MapValue& other,
-      std::function<void(Domain*, const Domain&)> operation) {
+  template <typename Operation> // void(Domain*, const Domain&)
+  AbstractValueKind meet_like_operation(const MapValue& other,
+                                        Operation&& operation) {
     for (const auto& other_binding : other.m_map) {
       auto binding = m_map.find(other_binding.first);
       if (binding == m_map.end()) {

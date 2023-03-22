@@ -16,6 +16,10 @@
 #include "Exceptions.h"
 
 namespace sparta {
+namespace ad_impl {
+template <typename Value, typename Derived>
+class AbstractDomainScaffoldingStaticAssert;
+} // namespace ad_impl
 
 /*
  * This is an API for abstract domains, which are the fundamental structures in
@@ -337,16 +341,10 @@ using actual_kind =
  *
  */
 template <typename Value, typename Derived>
-class AbstractDomainScaffolding : public AbstractDomain<Derived> {
+class AbstractDomainScaffolding
+    : public AbstractDomain<Derived>,
+      private ad_impl::AbstractDomainScaffoldingStaticAssert<Value, Derived> {
  public:
-  virtual ~AbstractDomainScaffolding() {
-    static_assert(std::is_base_of<AbstractValue<Value>, Value>::value,
-                  "Value doesn't inherit from AbstractValue");
-    static_assert(std::is_base_of<AbstractDomainScaffolding<Value, Derived>,
-                                  Derived>::value,
-                  "Derived doesn't inherit from AbstractDomainScaffolding");
-  }
-
   /*
    * The choice of lattice element returned by the default constructor is
    * completely arbitrary. In pratice though, the abstract value used to
@@ -457,9 +455,9 @@ class AbstractDomainScaffolding : public AbstractDomain<Derived> {
 
   const Value* get_value() const { return &m_value; }
 
-  void set_to_value(const Value& value) {
+  void set_to_value(Value value) {
     m_kind = value.kind();
-    m_value = value;
+    m_value = std::move(value);
   }
 
   // In some implementations, the data structure chosen to represent an abstract
@@ -487,8 +485,8 @@ class AbstractDomainScaffolding : public AbstractDomain<Derived> {
   }
 
  private:
-  void join_like_operation_with(const Derived& other,
-                                std::function<void()> operation) {
+  template <typename Operation> // void()
+  void join_like_operation_with(const Derived& other, Operation&& operation) {
     if (is_top() || other.is_bottom()) {
       return;
     }
@@ -504,8 +502,8 @@ class AbstractDomainScaffolding : public AbstractDomain<Derived> {
     operation();
   }
 
-  void meet_like_operation_with(const Derived& other,
-                                std::function<void()> operation) {
+  template <typename Operation> // void()
+  void meet_like_operation_with(const Derived& other, Operation&& operation) {
     if (is_bottom() || other.is_top()) {
       return;
     }
@@ -653,3 +651,19 @@ inline std::ostream& operator<<(
   o << d.unwrap();
   return o;
 }
+
+namespace sparta::ad_impl {
+
+template <typename Value, typename Derived>
+class AbstractDomainScaffoldingStaticAssert {
+ protected:
+  ~AbstractDomainScaffoldingStaticAssert() {
+    static_assert(std::is_base_of_v<AbstractValue<Value>, Value>,
+                  "Value doesn't inherit from AbstractValue");
+    static_assert(
+        std::is_base_of_v<AbstractDomainScaffolding<Value, Derived>, Derived>,
+        "Derived doesn't inherit from AbstractDomainScaffolding");
+  }
+};
+
+} // namespace sparta::ad_impl

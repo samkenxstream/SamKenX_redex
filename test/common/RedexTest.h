@@ -45,6 +45,7 @@ struct RedexIntegrationTest : public RedexTest {
   boost::optional<DexClasses&> classes;
   DexMetadata dex_metadata;
   redex::TempDir configfiles_out_dir;
+  std::unique_ptr<ConfigFiles> conf;
   std::unique_ptr<PassManager> pass_manager;
 
  public:
@@ -58,9 +59,11 @@ struct RedexIntegrationTest : public RedexTest {
 
     dex_metadata.set_id("classes");
     DexStore root_store(dex_metadata);
-    root_store.add_classes(load_classes_from_dex(dex_file));
+    root_store.add_classes(
+        load_classes_from_dex(DexLocation::make_location("dex", dex_file)));
     if (secondary_dex_file) {
-      root_store.add_classes(load_classes_from_dex(secondary_dex_file));
+      root_store.add_classes(load_classes_from_dex(
+          DexLocation::make_location("dex", secondary_dex_file)));
     }
     classes = root_store.get_dexen().back();
     stores.emplace_back(std::move(root_store));
@@ -69,31 +72,56 @@ struct RedexIntegrationTest : public RedexTest {
 
   std::string& get_configfiles_out_dir() { return configfiles_out_dir.path; }
 
+  // NOTE: The defaults for RedexOptions are technically bad, as the
+  //       PassManager survives the `run_passes` call, at which point
+  //       the options object has gone out of scope. But simplicity...
+
   void run_passes(
       const std::vector<Pass*>& passes,
       std::unique_ptr<keep_rules::ProguardConfiguration> pg_config = nullptr,
-      const Json::Value& json_conf = Json::nullValue) {
-    run_passes(passes, std::move(pg_config), json_conf, [](const auto&) {});
+      const Json::Value& json_conf = Json::nullValue,
+      const RedexOptions& redex_options = RedexOptions{}) {
+    run_passes(
+        passes, std::move(pg_config), json_conf, [](const auto&) {},
+        [](const auto&) {}, redex_options);
   }
 
-  template <typename Fn>
+  template <typename MgrFn>
   void run_passes(const std::vector<Pass*>& passes,
                   std::unique_ptr<keep_rules::ProguardConfiguration> pg_config,
                   const Json::Value& json_conf,
-                  const Fn& fn) {
+                  const MgrFn& mgr_fn,
+                  const RedexOptions& redex_options = RedexOptions{}) {
+    run_passes(
+        passes, std::move(pg_config), json_conf, [](const auto&) {}, mgr_fn,
+        redex_options);
+  }
+
+  template <typename ConfFn, typename MgrFn>
+  void run_passes(const std::vector<Pass*>& passes,
+                  std::unique_ptr<keep_rules::ProguardConfiguration> pg_config,
+                  const Json::Value& json_conf,
+                  const ConfFn& conf_fn,
+                  const MgrFn& mgr_fn,
+                  const RedexOptions& redex_options = RedexOptions{}) {
+    conf = std::make_unique<ConfigFiles>(json_conf);
+    conf->parse_global_config();
+
+    conf_fn(*conf);
+
     if (pg_config) {
       pass_manager = std::make_unique<PassManager>(passes, std::move(pg_config),
-                                                   json_conf);
+                                                   *conf, redex_options);
     } else {
-      pass_manager = std::make_unique<PassManager>(passes, json_conf);
+      pass_manager =
+          std::make_unique<PassManager>(passes, *conf, redex_options);
     }
 
-    fn(*pass_manager);
+    mgr_fn(*pass_manager);
 
     pass_manager->set_testing_mode();
-    ConfigFiles conf(json_conf);
-    conf.set_outdir(configfiles_out_dir.path);
-    pass_manager->run_passes(stores, conf);
+    conf->set_outdir(configfiles_out_dir.path);
+    pass_manager->run_passes(stores, *conf);
   }
 
   virtual ~RedexIntegrationTest() {}

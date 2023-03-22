@@ -64,10 +64,11 @@ class SourceBlocksTest : public RedexTest {
       auto vec = gather_source_blocks(block);
       for (auto* sb : vec) {
         oss << " " << show(sb->src) << "@" << sb->id;
-        if (!sb->vals.empty()) {
+        if (sb->vals_size > 0) {
           oss << "(";
           bool first_val = true;
-          for (const auto& val : sb->vals) {
+          for (size_t i = 0; i < sb->vals_size; i++) {
+            auto& val = sb->vals[i];
             if (!first_val) {
               oss << "|";
             }
@@ -144,7 +145,7 @@ TEST_F(SourceBlocksTest, minimal_serialize) {
   method->get_code()->build_cfg();
   auto& cfg = method->get_code()->cfg();
 
-  ASSERT_EQ(cfg.blocks().size(), 1u);
+  ASSERT_EQ(cfg.num_blocks(), 1u);
 
   auto res = insert_source_blocks(method, &cfg, {},
                                   /*serialize=*/true);
@@ -158,7 +159,7 @@ TEST_F(SourceBlocksTest, complex_serialize) {
   method->get_code()->build_cfg();
   auto& cfg = method->get_code()->cfg();
 
-  ASSERT_EQ(cfg.blocks().size(), 1u);
+  ASSERT_EQ(cfg.num_blocks(), 1u);
   auto b = cfg.blocks()[0];
 
   // We're gonna just focus on blocks and edges, no instruction constraints.
@@ -191,7 +192,7 @@ TEST_F(SourceBlocksTest, complex_deserialize) {
   method->get_code()->build_cfg();
   auto& cfg = method->get_code()->cfg();
 
-  ASSERT_EQ(cfg.blocks().size(), 1u);
+  ASSERT_EQ(cfg.num_blocks(), 1u);
   auto b = cfg.blocks()[0];
 
   // We're gonna just focus on blocks and edges, no instruction constraints.
@@ -229,7 +230,7 @@ TEST_F(SourceBlocksTest, complex_deserialize_default) {
   method->get_code()->build_cfg();
   auto& cfg = method->get_code()->cfg();
 
-  ASSERT_EQ(cfg.blocks().size(), 1u);
+  ASSERT_EQ(cfg.num_blocks(), 1u);
   auto b = cfg.blocks()[0];
 
   // We're gonna just focus on blocks and edges, no instruction constraints.
@@ -266,7 +267,7 @@ TEST_F(SourceBlocksTest, complex_deserialize_failure) {
   method->get_code()->build_cfg();
   auto& cfg = method->get_code()->cfg();
 
-  ASSERT_EQ(cfg.blocks().size(), 1u);
+  ASSERT_EQ(cfg.num_blocks(), 1u);
   auto b = cfg.blocks()[0];
 
   // We're gonna just focus on blocks and edges, no instruction constraints.
@@ -399,7 +400,7 @@ TEST_F(SourceBlocksTest, complex_deserialize_failure_error_val) {
   method->get_code()->build_cfg();
   auto& cfg = method->get_code()->cfg();
 
-  ASSERT_EQ(cfg.blocks().size(), 1u);
+  ASSERT_EQ(cfg.num_blocks(), 1u);
   auto b = cfg.blocks()[0];
 
   // We're gonna just focus on blocks and edges, no instruction constraints.
@@ -575,7 +576,7 @@ TEST_F(SourceBlocksTest, deserialize_x) {
   method->get_code()->build_cfg();
   auto& cfg = method->get_code()->cfg();
 
-  ASSERT_EQ(cfg.blocks().size(), 1u);
+  ASSERT_EQ(cfg.num_blocks(), 1u);
   auto b = cfg.blocks()[0];
 
   // We're gonna just focus on blocks and edges, no instruction constraints.
@@ -608,6 +609,8 @@ B4: LFoo;.bar:()V@3(0.4:0.2))");
 }
 
 TEST_F(SourceBlocksTest, coalesce) {
+  IRList::CONSECUTIVE_STYLE = IRList::ConsecutiveStyle::kChain;
+
   auto foo_method = create_method("LFoo");
 
   constexpr const char* kCode = R"(

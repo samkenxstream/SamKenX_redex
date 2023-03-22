@@ -99,8 +99,8 @@ TypeSet MergeabilityChecker::exclude_unsupported_bytecode_refs_for(
 
     // The presence of type-like strings can indicate that types are used by
     // reflection, and then it's not safe to merge those types.
-    if (m_spec.type_like_const_strings_unsafe &&
-        insn->opcode() == OPCODE_CONST_STRING) {
+    if (m_spec.exclude_type_like_strings() &&
+        opcode::is_const_string(insn->opcode())) {
       const DexString* str = insn->get_string();
       std::string class_name = java_names::external_to_internal(str->str());
       DexType* maybe_type = DexType::get_type(class_name);
@@ -117,10 +117,9 @@ TypeSet MergeabilityChecker::exclude_unsupported_bytecode_refs_for(
     // Java language level enforcement recommended!
     //
     // For mergeables with type tags, it is not safe to merge those
-    // used with CONST_CLASS or NEW_ARRAY since we will lose
-    // granularity as we can't map to the old type anymore.
-    if (has_type_tag && insn->opcode() != OPCODE_CONST_CLASS &&
-        insn->opcode() != OPCODE_NEW_ARRAY) {
+    // referenced by CONST_CLASS, since we will lose granularity as we can't map
+    // to the old type anymore.
+    if (has_type_tag && !opcode::is_const_class(insn->opcode())) {
       continue;
     }
 
@@ -138,14 +137,14 @@ TypeSet MergeabilityChecker::exclude_unsupported_bytecode_refs_for(
     //      CHECK_CAST <type_0>
     //    else labe:
     //      CHECK_CAST <type_1>
-    if (!has_type_tag && insn->opcode() != OPCODE_INSTANCE_OF) {
+    if (!has_type_tag && !opcode::is_instance_of(insn->opcode())) {
       continue;
     }
 
     const auto& type = type::get_element_type_if_array(insn->get_type());
     if (m_spec.merging_targets.count(type) > 0) {
 
-      if (insn->opcode() != OPCODE_CONST_CLASS ||
+      if (!opcode::is_const_class(insn->opcode()) ||
           m_const_class_safe_types.empty()) {
         non_mergeables.insert(type);
       } else {
@@ -236,12 +235,13 @@ void MergeabilityChecker::exclude_static_fields(TypeSet& non_mergeables) {
 
 void MergeabilityChecker::exclude_unsafe_sdk_and_store_refs(
     TypeSet& non_mergeables) {
+  const auto mog = method_override_graph::build_graph(m_scope);
   for (auto type : m_spec.merging_targets) {
     if (non_mergeables.count(type)) {
       continue;
     }
     auto cls = type_class(type);
-    if (!m_ref_checker.check_class(cls)) {
+    if (!m_ref_checker.check_class(cls, mog)) {
       non_mergeables.insert(type);
     }
     if (!m_spec.include_primary_dex && m_ref_checker.is_in_primary_dex(type)) {

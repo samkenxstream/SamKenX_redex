@@ -127,6 +127,7 @@ struct SourceBlock {
     static constexpr float kNoneVal = std::numeric_limits<float>::quiet_NaN();
 
    public:
+    Val() {}
     constexpr Val(float v, float a) noexcept : m_val({v, a}) {}
 
     static constexpr Val none() { return Val(kNoneVal, kNoneVal); }
@@ -168,17 +169,22 @@ struct SourceBlock {
    private:
     ValPair m_val;
   };
-  std::vector<Val> vals;
+  const uint32_t vals_size{0};
+  const std::unique_ptr<Val[]> vals;
 
   SourceBlock() = default;
   SourceBlock(const DexString* src, size_t id) : src(src), id(id) {}
-  SourceBlock(const DexString* src, size_t id, std::vector<Val> v)
-      : src(src), id(id), vals(std::move(v)) {}
+  SourceBlock(const DexString* src, size_t id, const std::vector<Val>& v)
+      : src(src),
+        id(id),
+        vals_size(v.size()),
+        vals(clone_vals(v.data(), v.size())) {}
   SourceBlock(const SourceBlock& other)
       : src(other.src),
         next(other.next == nullptr ? nullptr : new SourceBlock(*other.next)),
         id(other.id),
-        vals(other.vals) {}
+        vals_size(other.vals_size),
+        vals(clone_vals(other.vals.get(), other.vals_size)) {}
 
   boost::optional<float> get_val(size_t i) const {
     return vals[i] ? boost::optional<float>(vals[i]->val) : boost::none;
@@ -187,16 +193,26 @@ struct SourceBlock {
     return vals[i] ? boost::optional<float>(vals[i]->appear100) : boost::none;
   }
 
+  static std::unique_ptr<Val[]> clone_vals(const Val* vals, size_t vals_size) {
+    auto res = std::make_unique<Val[]>(vals_size);
+    for (size_t i = 0; i < vals_size; i++) {
+      res[i] = vals[i];
+    }
+    return res;
+  }
+
   template <typename Fn>
   void foreach_val(const Fn& fn) const {
-    for (const auto& val : vals) {
+    for (size_t i = 0; i < vals_size; i++) {
+      auto& val = vals[i];
       fn(val);
     }
   }
 
   template <typename Fn>
   bool foreach_val_early(const Fn& fn) const {
-    for (const auto& val : vals) {
+    for (size_t i = 0; i < vals_size; i++) {
+      auto& val = vals[i];
       if (fn(val)) {
         return true;
       }
@@ -205,7 +221,15 @@ struct SourceBlock {
   }
 
   bool operator==(const SourceBlock& other) const {
-    return src == other.src && id == other.id && vals == other.vals;
+    if (src != other.src || id != other.id || vals_size != other.vals_size) {
+      return false;
+    }
+    for (size_t i = 0; i < vals_size; i++) {
+      if (vals[i] != other.vals[i]) {
+        return false;
+      }
+    }
+    return true;
   }
 
   void append(std::unique_ptr<SourceBlock> sb) {
@@ -232,7 +256,22 @@ struct SourceBlock {
   }
 
   std::string show(bool quoted_src = false) const;
+
+  void max(const SourceBlock& other) {
+    size_t len = std::min(vals_size, other.vals_size);
+    for (size_t i = 0; i != len; ++i) {
+      if (!vals[i]) {
+        vals[i] = other.vals[i];
+      } else if (other.vals[i]) {
+        vals[i]->val = std::max(vals[i]->val, other.vals[i]->val);
+        vals[i]->appear100 =
+            std::max(vals[i]->appear100, other.vals[i]->appear100);
+      }
+    }
+  }
 };
+
+static_assert(sizeof(void*) != 8 || sizeof(SourceBlock) == 32);
 
 /*
  * MethodItemEntry (and the IRLists that it gets linked into) is a data
@@ -568,6 +607,17 @@ class IRList {
     return m_list.iterator_to(mie);
   }
 
+  enum class ConsecutiveStyle {
+    kChain,
+    kDrop,
+    kMax, // This is for as long as kDrop is not correct because of profile
+          // issues.
+  };
+  static ConsecutiveStyle CONSECUTIVE_STYLE;
+
+  void chain_consecutive_source_blocks(
+      ConsecutiveStyle style = CONSECUTIVE_STYLE);
+
   friend std::string show(const IRCode*);
 };
 
@@ -619,8 +669,12 @@ class InstructionIteratorImpl {
   InstructionIteratorImpl(const InstructionIteratorImpl<false>& rhs)
       : m_it(rhs.m_it), m_end(rhs.m_end) {}
 
-  InstructionIteratorImpl& operator=(const InstructionIteratorImpl& other) =
-      default;
+  InstructionIteratorImpl& operator=(
+      const InstructionIteratorImpl<false>& rhs) {
+    m_it = rhs.m_it;
+    m_end = rhs.m_end;
+    return *this;
+  }
 
   InstructionIteratorImpl& operator++() {
     ++m_it;

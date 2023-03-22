@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include <functional>
 #include <gtest/gtest.h>
 
 #include "DexClass.h"
@@ -24,8 +25,9 @@ struct PreVerify : public RedexTest {
   DexClasses classes;
   ResourceFiles resources;
   PreVerify()
-      : classes(load_classes_from_dex(std::getenv("dex_pre"),
-                                      /* balloon */ false)),
+      : classes(load_classes_from_dex(
+            DexLocation::make_location("", std::getenv("dex_pre")),
+            /* balloon */ false)),
         resources(
             decode_resource_paths(std::getenv("extracted_resources"), "pre")) {}
 };
@@ -34,13 +36,20 @@ struct PostVerify : public RedexTest {
   DexClasses classes;
   ResourceFiles resources;
   PostVerify()
-      : classes(load_classes_from_dex(std::getenv("dex_post"),
-                                      /* balloon */ false)),
+      : classes(load_classes_from_dex(
+            DexLocation::make_location("", std::getenv("dex_post")),
+            /* balloon */ false)),
         resources(decode_resource_paths(std::getenv("extracted_resources"),
                                         "post")) {}
 };
 
+// \returns -1 if no class with \name is found. Otherwise, \returns the the
+// class's idx in \classes list.
+int find_class_idx(const DexClasses& classes, const char* name);
+
 DexClass* find_class_named(const DexClasses& classes, const char* name);
+DexClass* find_class_named(const DexClasses& classes,
+                           const std::function<bool(const char*)>& matcher);
 DexField* find_ifield_named(const DexClass& cls, const char* name);
 DexField* find_sfield_named(const DexClass& cls, const char* name);
 DexField* find_field_named(const DexClass& cls, const char* name);
@@ -59,7 +68,7 @@ DexOpcodeMethod* find_invoke(std::vector<DexInstruction*>::iterator begin,
                              DexType* receiver = nullptr);
 DexInstruction* find_instruction(DexMethod* m, DexOpcode opcode);
 
-void verify_type_erased(const DexClass* cls, size_t num_dmethods = 0);
+void verify_class_merged(const DexClass* cls, size_t num_dmethods = 0);
 
 // A quick helper to dump CFGs before/after verify
 //

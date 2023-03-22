@@ -37,7 +37,8 @@ void load_types(const std::vector<std::string>& type_names, Types& types) {
 /**
  * Verify model specs are consistent
  */
-bool verify_model_spec(const ModelSpec& model_spec) {
+bool verify_model_spec(const std::vector<ModelSpec>& model_specs,
+                       const ModelSpec& model_spec) {
   always_assert_log(
       !model_spec.name.empty(),
       "[ClassMerging] Wrong specification: model must have \"name\"");
@@ -61,24 +62,14 @@ bool verify_model_spec(const ModelSpec& model_spec) {
         "[ClassMerging] Wrong specification: model %s must have \"roots\"",
         model_spec.name.c_str());
   }
+
+  for (const auto& spec : model_specs) {
+    bool duplicated =
+        spec.name == model_spec.name || spec.roots == model_spec.roots;
+    always_assert_log(!duplicated, "Duplicated model spec %s",
+                      model_spec.name.c_str());
+  }
   return true;
-}
-
-InterDexGroupingType get_merge_per_interdex_type(
-    const std::string& merge_per_interdex_set) {
-
-  const static std::unordered_map<std::string, InterDexGroupingType>
-      string_to_grouping = {
-          {"disabled", InterDexGroupingType::DISABLED},
-          {"non-hot-set", InterDexGroupingType::NON_HOT_SET},
-          {"non-ordered-set", InterDexGroupingType::NON_ORDERED_SET},
-          {"full", InterDexGroupingType::FULL}};
-
-  always_assert_log(string_to_grouping.count(merge_per_interdex_set) > 0,
-                    "InterDex Grouping Type %s not found. Please check the list"
-                    " of accepted values.",
-                    merge_per_interdex_set.c_str());
-  return string_to_grouping.at(merge_per_interdex_set);
 }
 
 strategy::Strategy get_merging_strategy(const std::string& merging_strategy) {
@@ -109,6 +100,14 @@ TypeTagConfig get_type_tag_config(const std::string& type_tag_config) {
   TRACE(CLMG, 5, "type tag config %s %d", type_tag_config.c_str(),
         string_to_config.at(type_tag_config));
   return string_to_config.at(type_tag_config);
+}
+
+TypeLikeStringConfig get_type_like_string_config(
+    const std::string& type_like_string_config) {
+  const static std::unordered_map<std::string, TypeLikeStringConfig>
+      string_to_config = {{"replace", TypeLikeStringConfig::REPLACE},
+                          {"exclude", TypeLikeStringConfig::EXCLUDE}};
+  return string_to_config.at(type_like_string_config);
 }
 
 } // namespace
@@ -218,13 +217,11 @@ void ClassMergingPass::bind_config() {
       model.strategy = get_merging_strategy(merging_strategy);
 
       // InterDex grouping option is by default `non-ordered-set`.
-      std::string merge_per_interdex_set;
-      model_spec.get("merge_per_interdex_set", "non-ordered-set",
-                     merge_per_interdex_set);
-      model.merge_per_interdex_set =
-          get_merge_per_interdex_type(merge_per_interdex_set);
+      std::string interdex_grouping;
+      model_spec.get("interdex_grouping", "non-ordered-set", interdex_grouping);
+      model.interdex_grouping = get_merge_per_interdex_type(interdex_grouping);
 
-      always_assert_log(!model.merge_per_interdex_set ||
+      always_assert_log(!model.interdex_grouping ||
                             (model.type_tag_config != TypeTagConfig::NONE),
                         "Cannot group %s when type tag is not needed.",
                         model.name.c_str());
@@ -237,10 +234,20 @@ void ClassMergingPass::bind_config() {
       model_spec.get("merge_types_with_static_fields", false,
                      model.merge_types_with_static_fields);
       model_spec.get("keep_debug_info", false, model.keep_debug_info);
-      model_spec.get("replace_type_like_const_strings", true,
-                     model.replace_type_like_const_strings);
-      model_spec.get("type_like_const_strings_unsafe", false,
-                     model.type_like_const_strings_unsafe);
+
+      // TypeLikeStringConfig defaults to `exclude`.
+      std::string type_like_string_config;
+      model_spec.get("type_like_string_config", "exclude",
+                     type_like_string_config);
+      model.type_like_string_confg =
+          get_type_like_string_config(type_like_string_config);
+      if (model.type_like_string_confg == TypeLikeStringConfig::REPLACE) {
+        always_assert_log(
+            model.type_tag_config != TypeTagConfig::GENERATE,
+            "Type like strings are not safe to replace with TypeTagConfig %s",
+            type_tag_config.c_str());
+      }
+
       if (max_count > 0) {
         model.max_count = boost::optional<size_t>(max_count);
       }
@@ -254,7 +261,7 @@ void ClassMergingPass::bind_config() {
       model.interdex_grouping_inferring_mode =
           parse_grouping_inferring_mode(usage_mode_str, default_mode);
 
-      if (!verify_model_spec(model)) {
+      if (!verify_model_spec(m_model_specs, model)) {
         continue;
       }
 

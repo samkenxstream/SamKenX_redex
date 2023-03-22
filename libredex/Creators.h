@@ -248,14 +248,10 @@ struct MethodBlock {
   // Helper
   void init_loc(Location& loc);
 
-  void binop_lit16(IROpcode op,
-                   const Location& dest,
-                   const Location& src,
-                   int16_t literal);
-  void binop_lit8(IROpcode op,
-                  const Location& dest,
-                  const Location& src,
-                  int8_t literal);
+  void binop_lit(IROpcode op,
+                 const Location& dest,
+                 const Location& src,
+                 int16_t literal);
 
   //
   // branch instruction
@@ -403,6 +399,9 @@ struct MethodCreator {
                 std::unique_ptr<DexAnnotationSet> anno = nullptr,
                 bool with_debug_item = true);
 
+  MethodCreator(MethodCreator&&) noexcept = default;
+  MethodCreator& operator=(MethodCreator&&) noexcept = default;
+
   /**
    * Get an existing local.
    */
@@ -507,9 +506,12 @@ struct MethodCreator {
  * Once create is called this creator should not be used any longer.
  */
 struct ClassCreator {
-  explicit ClassCreator(DexType* type, const std::string& location = "") {
+  explicit ClassCreator(DexType* type, const DexLocation* location = nullptr) {
     always_assert_log(type_class(type) == nullptr,
                       "class already exists for %s\n", show_type(type).c_str());
+    if (location == nullptr) {
+      location = DexLocation::make_location("", "");
+    }
     m_cls = new DexClass(location);
     m_cls->m_self = type;
     m_cls->m_access_flags = (DexAccessFlags)0;

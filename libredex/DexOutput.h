@@ -17,10 +17,10 @@
 #include "DexMethodHandle.h"
 #include "DexStats.h"
 #include "DexUtil.h"
+#include "GlobalConfig.h"
 #include "Pass.h"
 #include "PostLowering.h"
 #include "ProguardMap.h"
-#include "RedexOptions.h"
 #include "Trace.h"
 
 #include <locator.h>
@@ -28,6 +28,8 @@ using facebook::Locator;
 
 class DexAnnotation;
 class DexCallSite;
+
+enum class DebugInfoKind : uint32_t;
 
 using dexstring_to_idx = std::unordered_map<const DexString*, uint32_t>;
 using dextype_to_idx = std::unordered_map<DexType*, uint16_t>;
@@ -46,6 +48,7 @@ enum class SortMode {
   CLINIT_FIRST,
   METHOD_PROFILED_ORDER,
   METHOD_SIMILARITY,
+  METHOD_PROFILED_SECONDARY_ORDER,
   DEFAULT
 };
 
@@ -130,23 +133,34 @@ class DexOutputIdx {
 class IODIMetadata;
 class GatheredTypes;
 
-dex_stats_t write_classes_to_dex(
-    const RedexOptions&,
+struct enhanced_dex_stats_t : public dex_stats_t {
+  std::unordered_map<const DexClass*, size_t> class_size;
+
+  enhanced_dex_stats_t& operator+=(const enhanced_dex_stats_t& rhs) {
+    dex_stats_t::operator+=(rhs);
+    class_size.insert(rhs.class_size.begin(), rhs.class_size.end());
+    return *this;
+  }
+};
+
+enhanced_dex_stats_t write_classes_to_dex(
     const std::string& filename,
     DexClasses* classes,
     std::shared_ptr<GatheredTypes> gtypes,
     LocatorIndex* locator_index /* nullable */,
     size_t store_number,
+    const std::string* store_name,
     size_t dex_number,
     ConfigFiles& conf,
     PositionMapper* pos_mapper,
+    DebugInfoKind debug_info_kind,
     std::unordered_map<DexMethod*, uint64_t>* method_to_id,
     std::unordered_map<DexCode*, std::vector<DebugLineItem>>* code_debug_lines,
     IODIMetadata* iodi_metadata,
     const std::string& dex_magic,
+    const DexOutputConfig& dex_output_config = DexOutputConfig{},
     PostLowering* post_lowering = nullptr,
-    int min_sdk = 0,
-    bool disable_method_similarity_order = false);
+    int min_sdk = 0);
 
 using cmp_dstring = bool (*)(const DexString*, const DexString*);
 using cmp_dtype = bool (*)(const DexType*, const DexType*);
@@ -220,7 +234,6 @@ class GatheredTypes {
   std::vector<DexType*> m_ltype;
   std::vector<DexFieldRef*> m_lfield;
   std::vector<DexMethodRef*> m_lmethod;
-  std::vector<DexTypeList*> m_additional_ltypelists;
   std::vector<DexCallSite*> m_lcallsite;
   std::vector<DexMethodHandle*> m_lmethodhandle;
   DexClasses* m_classes;
@@ -260,11 +273,14 @@ class GatheredTypes {
 
   void gather_class(int num);
 
-  void sort_dexmethod_emitlist_method_ref_order(std::vector<DexMethod*>& lmeth);
+  void sort_dexmethod_emitlist_method_similarity_order(
+      std::vector<DexMethod*>& lmeth);
   void sort_dexmethod_emitlist_default_order(std::vector<DexMethod*>& lmeth);
   void sort_dexmethod_emitlist_cls_order(std::vector<DexMethod*>& lmeth);
   void sort_dexmethod_emitlist_clinit_order(std::vector<DexMethod*>& lmeth);
   void sort_dexmethod_emitlist_profiled_order(std::vector<DexMethod*>& lmeth);
+  void sort_dexmethod_emitlist_profiled_secondary_order(
+      std::vector<DexMethod*>& lmeth);
   void set_config(ConfigFiles* config);
 
   std::unordered_set<const DexString*> index_type_names();
@@ -296,7 +312,7 @@ class DexOutput {
   friend class DexOutputTest;
 
  public:
-  dex_stats_t m_stats;
+  enhanced_dex_stats_t m_stats;
 
   static constexpr size_t kIODILayerBits = 4;
   static constexpr size_t kIODILayerBound = 1 << (kIODILayerBits - 1);
@@ -315,6 +331,7 @@ class DexOutput {
   uint32_t m_offset;
   const char* m_filename;
   size_t m_store_number;
+  const std::string* m_store_name;
   size_t m_dex_number;
   DebugInfoKind m_debug_info_kind;
   IODIMetadata* m_iodi_metadata;
@@ -338,6 +355,7 @@ class DexOutput {
   bool m_normal_primary_dex;
   const ConfigFiles& m_config_files;
   int m_min_sdk;
+  const DexOutputConfig m_dex_output_config;
 
   void insert_map_item(uint16_t maptype,
                        uint32_t size,
@@ -397,6 +415,7 @@ class DexOutput {
             LocatorIndex* locator_index,
             bool normal_primary_dex,
             size_t store_number,
+            const std::string* store_name,
             size_t dex_number,
             DebugInfoKind debug_info_kind,
             IODIMetadata* iodi_metadata,
@@ -405,6 +424,7 @@ class DexOutput {
             std::unordered_map<DexMethod*, uint64_t>* method_to_id,
             std::unordered_map<DexCode*, std::vector<DebugLineItem>>*
                 code_debug_lines,
+            const DexOutputConfig& dex_output_config = DexOutputConfig{},
             PostLowering* post_lowering = nullptr,
             int min_sdk = 0);
   void prepare(SortMode string_mode,

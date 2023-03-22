@@ -7,6 +7,7 @@
 
 #include "ConfigFiles.h"
 
+#include <boost/algorithm/string.hpp>
 #include <boost/filesystem.hpp>
 #include <fstream>
 #include <json/json.h>
@@ -20,6 +21,8 @@
 #include "MethodProfiles.h"
 #include "ProguardMap.h"
 
+using namespace std::string_literals;
+
 ConfigFiles::ConfigFiles(const Json::Value& config, const std::string& outdir)
     : m_json(config),
       outdir(outdir),
@@ -28,7 +31,8 @@ ConfigFiles::ConfigFiles(const Json::Value& config, const std::string& outdir)
           new ProguardMap(config.get("proguard_map", "").asString(),
                           config.get("use_new_rename_map", 0).asBool())),
       m_printseeds(config.get("printseeds", "").asString()),
-      m_method_profiles(new method_profiles::MethodProfiles()) {
+      m_method_profiles(new method_profiles::MethodProfiles()),
+      m_secondary_method_profiles(new method_profiles::MethodProfiles()) {
 
   m_coldstart_class_filename = config.get("coldstart_classes", "").asString();
   if (m_coldstart_class_filename.empty()) {
@@ -62,12 +66,27 @@ const std::unordered_set<DexType*>& ConfigFiles::get_no_optimizations_annos() {
     if (!no_optimizations_anno.empty()) {
       for (auto const& config_anno_name : no_optimizations_anno) {
         std::string anno_name = config_anno_name.asString();
-        DexType* anno = DexType::get_type(anno_name.c_str());
+        DexType* anno = DexType::get_type(anno_name);
         if (anno) m_no_optimizations_annos.insert(anno);
       }
     }
   }
   return m_no_optimizations_annos;
+}
+
+const std::unordered_set<std::string>&
+ConfigFiles::get_no_optimizations_blocklist() {
+  if (m_no_optimizations_blocklist.empty()) {
+    Json::Value no_optimizations_blocklist;
+    m_json.get("no_optimizations_blocklist", Json::nullValue,
+               no_optimizations_blocklist);
+    if (!no_optimizations_blocklist.empty()) {
+      for (auto const& name : no_optimizations_blocklist) {
+        m_no_optimizations_blocklist.insert(name.asString());
+      }
+    }
+  }
+  return m_no_optimizations_blocklist;
 }
 
 /**
@@ -134,26 +153,46 @@ std::vector<std::string> ConfigFiles::load_coldstart_classes() {
   if (m_coldstart_class_filename.empty()) {
     return {};
   }
-  const char* kClassTail = ".class";
-  const size_t lentail = strlen(kClassTail);
-  auto file = m_coldstart_class_filename.c_str();
+
+  static constexpr std::string_view kClassTail = ".class";
+  static constexpr size_t lentail = kClassTail.size();
 
   std::vector<std::string> coldstart_classes;
 
-  std::ifstream input(file);
+  std::ifstream input(m_coldstart_class_filename);
   if (!input) {
-    fprintf(stderr,
-            "[error] Can not open <coldstart_classes> file, path is %s\n",
-            file);
-    exit(EXIT_FAILURE);
+    throw RedexException(
+        RedexError::INVALID_BETAMAP,
+        "[error] Can not open <coldstart_classes> file, path is "s +
+            m_coldstart_class_filename);
   }
+
+  auto validate_class_spec =
+      [](std::string_view class_spec) -> std::pair<bool, size_t> {
+    if (lentail >= class_spec.size()) {
+      return {false, static_cast<size_t>(-1)};
+    }
+
+    auto pos_tail = class_spec.size() - lentail;
+
+    if (class_spec.compare(pos_tail, lentail, kClassTail) != 0) {
+      return {false, static_cast<size_t>(-1)};
+    }
+
+    return {true, pos_tail};
+  };
+
   std::string clzname;
   while (input >> clzname) {
-    long position = clzname.length() - lentail;
-    always_assert_log(position >= 0,
-                      "Bailing, invalid class spec '%s' in interdex file %s\n",
-                      clzname.c_str(), file);
-    clzname.replace(position, lentail, ";");
+    auto [valid_class_spec, pos_tail] = validate_class_spec(clzname);
+    if (!valid_class_spec) {
+      throw RedexException(RedexError::INVALID_BETAMAP,
+                           "Bailing, invalid class spec"s +
+                               m_coldstart_class_filename +
+                               " in interdex file " + clzname);
+    }
+
+    clzname.replace(pos_tail, lentail, ";");
     coldstart_classes.emplace_back(
         m_proguard_map->translate_class("L" + clzname));
   }
@@ -196,7 +235,31 @@ ConfigFiles::load_class_lists() {
   return lists;
 }
 
-const std::vector<std::string>& ConfigFiles::get_dead_class_list() {
+const std::unordered_map<std::string, int64_t>&
+ConfigFiles::get_dead_class_list() {
+  build_dead_class_and_live_class_split_lists();
+  return m_dead_classes;
+}
+
+const std::unordered_set<std::string>&
+ConfigFiles::get_live_class_split_list() {
+  build_dead_class_and_live_class_split_lists();
+  return m_live_relocated_classes;
+}
+
+bool ConfigFiles::is_relocated_class(std::string_view name) const {
+  return boost::algorithm::ends_with(name, CLASS_SPLITTING_RELOCATED_SUFFIX);
+}
+
+void ConfigFiles::remove_relocated_part(std::string_view* name) {
+  always_assert(name != nullptr);
+  if (name->length() < CLASS_SPLITTING_RELOCATED_SUFFIX_LEN) {
+    return;
+  }
+  name->remove_suffix(CLASS_SPLITTING_RELOCATED_SUFFIX_LEN);
+}
+
+void ConfigFiles::build_dead_class_and_live_class_split_lists() {
   if (!m_dead_class_list_attempted) {
     m_dead_class_list_attempted = true;
     std::string dead_class_list_filename;
@@ -209,25 +272,68 @@ const std::vector<std::string>& ConfigFiles::get_dead_class_list() {
                 dead_class_list_filename.c_str());
         exit(EXIT_FAILURE);
       }
-      std::string classname;
-      while (input >> classname) {
-        std::string converted = std::string("L") + classname + std::string(";");
+      for (std::string line; std::getline(input, line);) {
+        // trim trailing whitespace
+        line.erase(std::find_if(line.rbegin(), line.rend(),
+                                [](auto c) { return c > ' '; })
+                       .base(),
+                   line.end());
+        int64_t load_count = 50; // legacy
+        auto i = line.find('\t');
+        std::string_view classname;
+        if (i == std::string::npos) {
+          classname = line;
+        } else {
+          classname = ((std::string_view)line).substr(0, i);
+          char* endptr = nullptr;
+          long parsed = strtol(line.c_str() + i + 1, &endptr, 10);
+          always_assert(endptr == line.c_str() + line.length());
+          load_count = parsed;
+        }
+        bool is_relocated = is_relocated_class(classname);
+        if (is_relocated) {
+          remove_relocated_part(&classname);
+        }
+        std::string converted;
+        converted.reserve(classname.size() + 2);
+        converted.append(1, 'L');
+        converted.append(classname);
+        converted.append(1, ';');
         std::replace(converted.begin(), converted.end(), '.', '/');
-        auto translated = m_proguard_map->translate_class(converted);
-        m_dead_class_list.push_back(std::move(translated));
+        if (!is_relocated) {
+          auto translated = m_proguard_map->translate_class(converted);
+          m_dead_classes.emplace(std::move(translated), load_count);
+        } else {
+          // No need to proguard translate the name of the live classes since
+          // we use the unobfuscated name. The unobfuscated name is already
+          // translated in ProguardMap.apply_deobfuscated_names called
+          // from redex_frontend in main.cpp.
+          m_live_relocated_classes.insert(std::move(converted));
+        }
       }
     }
   }
-  return m_dead_class_list;
 }
 
-void ConfigFiles::ensure_agg_method_stats_loaded() {
+void ConfigFiles::ensure_agg_method_stats_loaded() const {
+  if (m_method_profiles->is_initialized()) {
+    return;
+  }
   std::vector<std::string> csv_filenames;
   get_json_config().get("agg_method_stats_files", {}, csv_filenames);
-  if (csv_filenames.empty() || m_method_profiles->is_initialized()) {
+  if (csv_filenames.empty()) {
     return;
   }
   m_method_profiles->initialize(csv_filenames);
+}
+
+void ConfigFiles::ensure_secondary_method_stats_loaded() const {
+  std::vector<std::string> csv_filenames;
+  get_json_config().get("secondary_method_stats_files", {}, csv_filenames);
+  if (csv_filenames.empty() || m_secondary_method_profiles->is_initialized()) {
+    return;
+  }
+  m_secondary_method_profiles->initialize(csv_filenames);
 }
 
 void ConfigFiles::load_inliner_config(inliner::InlinerConfig* inliner_config) {
@@ -248,6 +354,9 @@ void ConfigFiles::load_inliner_config(inliner::InlinerConfig* inliner_config) {
   jw.get("true_virtual_inline", false, inliner_config->true_virtual_inline);
   jw.get("throws", false, inliner_config->throws_inline);
   jw.get("throw_after_no_return", false, inliner_config->throw_after_no_return);
+  jw.get("max_cost_for_constant_propagation",
+         MAX_COST_FOR_CONSTANT_PROPAGATION,
+         inliner_config->max_cost_for_constant_propagation);
   jw.get("enforce_method_size_limit",
          true,
          inliner_config->enforce_method_size_limit);
@@ -273,11 +382,16 @@ void ConfigFiles::load_inliner_config(inliner::InlinerConfig* inliner_config) {
   jw.get("respect_sketchy_methods", true,
          inliner_config->respect_sketchy_methods);
   jw.get("check_min_sdk_refs", true, inliner_config->check_min_sdk_refs);
+  size_t max_relevant_invokes_when_local_only;
+  jw.get("max_relevant_invokes_when_local_only", 10,
+         max_relevant_invokes_when_local_only);
+  inliner_config->max_relevant_invokes_when_local_only =
+      max_relevant_invokes_when_local_only;
 
   std::vector<std::string> no_inline_annos;
   jw.get("no_inline_annos", {}, no_inline_annos);
   for (const auto& type_s : no_inline_annos) {
-    auto type = DexType::get_type(type_s.c_str());
+    auto type = DexType::get_type(type_s);
     if (type != nullptr) {
       inliner_config->m_no_inline_annos.emplace(type);
     } else {
@@ -289,7 +403,7 @@ void ConfigFiles::load_inliner_config(inliner::InlinerConfig* inliner_config) {
   std::vector<std::string> force_inline_annos;
   jw.get("force_inline_annos", {}, force_inline_annos);
   for (const auto& type_s : force_inline_annos) {
-    auto type = DexType::get_type(type_s.c_str());
+    auto type = DexType::get_type(type_s);
     if (type != nullptr) {
       inliner_config->m_force_inline_annos.emplace(type);
     } else {
@@ -319,6 +433,11 @@ void ConfigFiles::load(const Scope& scope) {
 void ConfigFiles::process_unresolved_method_profile_lines() {
   ensure_agg_method_stats_loaded();
   m_method_profiles->process_unresolved_lines();
+}
+
+void ConfigFiles::process_unresolved_secondary_method_profile_lines() {
+  ensure_secondary_method_stats_loaded();
+  m_secondary_method_profiles->process_unresolved_lines();
 }
 
 const api::AndroidSDK& ConfigFiles::get_android_sdk_api(int32_t min_sdk_api) {
@@ -362,4 +481,10 @@ void ConfigFiles::set_outdir(const std::string& new_outdir) {
   auto meta_path = boost::filesystem::path(new_outdir) / "meta";
   boost::filesystem::create_directory(meta_path);
   outdir = new_outdir;
+}
+
+void ConfigFiles::set_class_lists(
+    std::unordered_map<std::string, std::vector<std::string>> l) {
+  m_class_lists = std::move(l);
+  m_load_class_lists_attempted = true;
 }

@@ -370,7 +370,7 @@ MergerType& Model::create_merger_helper(
   std::string name = shape.build_type_name(
       m_spec.class_name_prefix, merger_type, intf_set, dex_id, group_count,
       interdex_subgroup_idx, subgroup_idx);
-  const auto& shape_type = DexType::make_type(name.c_str());
+  const auto& shape_type = DexType::make_type(name);
   TRACE(CLMG, 7, "Build shape type %s", SHOW(shape_type));
   auto& merger_shape = create_merger_shape(shape_type, shape, merger_type,
                                            intf_set, group_values);
@@ -409,7 +409,9 @@ void Model::create_mergers_helper(
 void Model::exclude_types(const ConstTypeHashSet& exclude_types) {
   for (const auto& type : exclude_types) {
     const auto& cls = type_class(type);
-    redex_assert(cls != nullptr);
+    if (cls == nullptr) {
+      continue;
+    }
     if (is_interface(cls)) {
       const auto& impls = m_type_system.get_implementors(type);
       m_excluded.insert(impls.begin(), impls.end());
@@ -600,7 +602,8 @@ DexType* check_current_instance(const ConstTypeHashSet& types,
                                 IRInstruction* insn) {
   DexType* type = nullptr;
   if (insn->has_type()) {
-    type = insn->get_type();
+    type =
+        const_cast<DexType*>(type::get_element_type_if_array(insn->get_type()));
   } else if (insn->has_method()) {
     type = insn->get_method()->get_class();
   } else if (insn->has_field()) {
@@ -636,10 +639,7 @@ ConcurrentMap<DexType*, TypeHashSet> get_type_usages(
         [&cls](DexType* /* key */, std::unordered_set<DexType*>& set,
                bool /* already_exists */) { set.emplace(cls); };
 
-    if (insn->opcode() == OPCODE_CONST_CLASS ||
-        insn->opcode() == OPCODE_CHECK_CAST ||
-        insn->opcode() == OPCODE_INSTANCE_OF ||
-        insn->opcode() == OPCODE_NEW_INSTANCE) {
+    if (insn->has_type()) {
       auto current_instance = check_current_instance(types, insn);
       if (current_instance) {
         res.update(current_instance, updater);
@@ -756,6 +756,23 @@ size_t get_interdex_group(
 
 namespace class_merging {
 
+InterDexGroupingType get_merge_per_interdex_type(
+    const std::string& interdex_grouping) {
+
+  const static std::unordered_map<std::string, InterDexGroupingType>
+      string_to_grouping = {
+          {"disabled", InterDexGroupingType::DISABLED},
+          {"non-hot-set", InterDexGroupingType::NON_HOT_SET},
+          {"non-ordered-set", InterDexGroupingType::NON_ORDERED_SET},
+          {"full", InterDexGroupingType::FULL}};
+
+  always_assert_log(string_to_grouping.count(interdex_grouping) > 0,
+                    "InterDex Grouping Type %s not found. Please check the list"
+                    " of accepted values.",
+                    interdex_grouping.c_str());
+  return string_to_grouping.at(interdex_grouping);
+}
+
 std::ostream& operator<<(std::ostream& os,
                          ModelSpec::InterDexGroupingInferringMode mode) {
   switch (mode) {
@@ -815,7 +832,7 @@ TypeSet Model::get_types_in_current_interdex_group(
 std::vector<ConstTypeHashSet> Model::group_by_interdex_set(
     const ConstTypeHashSet& types) {
   size_t num_group = 1;
-  if (is_merge_per_interdex_set_enabled() && s_num_interdex_groups > 1) {
+  if (is_interdex_grouping_enabled() && s_num_interdex_groups > 1) {
     num_group = s_num_interdex_groups;
   }
   std::vector<ConstTypeHashSet> new_groups(num_group);
@@ -828,12 +845,12 @@ std::vector<ConstTypeHashSet> Model::group_by_interdex_set(
   for (const auto& pair : type_to_usages) {
     auto index = get_interdex_group(pair.second, s_cls_to_interdex_group,
                                     s_num_interdex_groups);
-    if (m_spec.merge_per_interdex_set == InterDexGroupingType::NON_HOT_SET) {
+    if (m_spec.interdex_grouping == InterDexGroupingType::NON_HOT_SET) {
       if (index == 0) {
         // Drop mergeables that are in the hot set.
         continue;
       }
-    } else if (m_spec.merge_per_interdex_set ==
+    } else if (m_spec.interdex_grouping ==
                InterDexGroupingType::NON_ORDERED_SET) {
       if (index < s_num_interdex_groups - 1) {
         // Only merge the last group which are not in ordered set, drop other
@@ -975,24 +992,25 @@ void Model::collect_methods() {
   // collect all vmethods and dmethods of mergeable types into the merger
   for (auto& merger_it : m_mergers) {
     auto& merger = merger_it.second;
-    if (merger.mergeables.empty()) continue;
+    if (merger.mergeables.empty()) {
+      continue;
+    }
     TRACE(CLMG,
           8,
           "Collect methods for merger %s [%ld]",
           SHOW(merger.type),
           merger.mergeables.size());
-    for (const auto& type : merger.mergeables) {
-      const auto& cls = type_class(type);
+    for (const auto* mergeable : merger.mergeables) {
+      const auto* cls = type_class(mergeable);
       always_assert(cls);
-      TRACE(CLMG, 8, "Merge %s", SHOW(type));
-
+      TRACE(CLMG, 8, "  mergeable %s", SHOW(mergeable));
       TRACE(CLMG,
             8,
             "%ld dmethods in %s",
             cls->get_dmethods().size(),
             SHOW(cls->get_type()));
       bool has_ctor = false;
-      for (const auto& method : cls->get_dmethods()) {
+      for (auto* method : cls->get_dmethods()) {
         if (method::is_init(method)) {
           has_ctor = true;
         }
@@ -1000,12 +1018,12 @@ void Model::collect_methods() {
       }
       always_assert_log(has_ctor,
                         "[ClassMerging] No ctor found for mergeable %s",
-                        SHOW(type));
+                        SHOW(mergeable));
 
-      const auto& virt_scopes = m_type_system.get_class_scopes().get(type);
+      const auto& virt_scopes = m_type_system.get_class_scopes().get(mergeable);
       TRACE(CLMG, 8, "%ld virtual scopes in %s", virt_scopes.size(),
-            SHOW(type));
-      for (const auto& virt_scope : virt_scopes) {
+            SHOW(mergeable));
+      for (const auto* virt_scope : virt_scopes) {
 
         // interface methods
         if (is_impl_scope(virt_scope)) {
@@ -1023,7 +1041,7 @@ void Model::collect_methods() {
                 8,
                 "non virtual scope %s (%s)",
                 virt_scope->methods[0]
-                    .first->get_deobfuscated_name_or_empty()
+                    .first->get_deobfuscated_name_or_empty_copy()
                     .c_str(),
                 SHOW(virt_scope->methods[0].first->get_name()));
           merger.non_virt_methods.emplace_back(virt_scope->methods[0].first);
@@ -1032,6 +1050,16 @@ void Model::collect_methods() {
 
         // virtual methods
         add_virtual_scope(merger, *virt_scope);
+      }
+    }
+
+    for (auto& intf_meths : merger.intfs_methods) {
+      if (intf_meths.methods.size() == merger.mergeables.size()) {
+        // If the InterfaceMethod entry completely overrides the overridden one,
+        // we don't need to track the overridden anymore. That way we don't
+        // generate a call to the overridden fall back, since it won't be
+        // reachable.
+        intf_meths.overridden_meth = nullptr;
       }
     }
   }
@@ -1047,7 +1075,9 @@ void Model::collect_methods() {
     auto cls = type_class(root_type);
     while (cls == nullptr) {
       const auto parent = m_parents.find(root_type);
-      if (parent == m_parents.end()) break;
+      if (parent == m_parents.end()) {
+        break;
+      }
       cls = type_class(parent->second);
     }
     // load all parents scopes
@@ -1066,25 +1096,42 @@ void Model::collect_methods() {
   }
 }
 
-// virtual methods
+/**
+ * Add methods in `virt_scope` to a new MergerType.vmethods entry.
+ * `virt_scope` is a VirtualScope rooted from a mergeable type of the current
+ * `merger`.
+ */
 void Model::add_virtual_scope(MergerType& merger,
                               const VirtualScope& virt_scope) {
-  merger.vmethods.emplace_back(nullptr, std::vector<DexMethod*>());
+  // Add a new MergerType.vmethods entry w/o the base. This is just the
+  // placeholder. VirtualMethod.base and VirtualMethod.overrides are to be
+  // populated at a later point.
+  merger.vmethods.emplace_back(nullptr);
   for (const auto& vmeth : virt_scope.methods) {
     TRACE(CLMG, 9, "check virtual method %s", SHOW(vmeth.first));
     always_assert_log(vmeth.first->is_def(), "not def %s", SHOW(vmeth.first));
-    if (merger.mergeables.count(vmeth.first->get_class()) == 0) continue;
+    if (merger.mergeables.count(vmeth.first->get_class()) == 0) {
+      continue;
+    }
     TRACE(CLMG, 8, "add virtual method %s", SHOW(vmeth.first));
-    merger.vmethods.back().second.emplace_back(vmeth.first);
+    merger.vmethods.back().overrides.emplace_back(vmeth.first);
   }
 }
 
+/**
+ * Add methods in `virt_scope` to a new MergerType.intfs_methods entry.
+ * `virt_scope` is a VirtualScope rooted from a mergeable type of the current
+ * `merger`. `virt_scope` is also known to implement at least one interface
+ * method.
+ */
 void Model::add_interface_scope(MergerType& merger,
                                 const VirtualScope& intf_scope) {
 
-  const auto& insert = [&](MergerType::InterfaceMethod& intf_meths) {
-    intf_meths.interfaces.insert(intf_scope.interfaces.begin(),
-                                 intf_scope.interfaces.end());
+  const auto& insert_to = [&merger, &intf_scope](
+                              MergerType::InterfaceMethod& intf_meth) {
+    bool inserted = false;
+    intf_meth.interfaces.insert(intf_scope.interfaces.begin(),
+                                intf_scope.interfaces.end());
     for (const auto& vmeth : intf_scope.methods) {
       // Only insert method defs
       if (!vmeth.first->is_def()) {
@@ -1097,9 +1144,40 @@ void Model::add_interface_scope(MergerType& merger,
       TRACE(CLMG,
             8,
             "add interface method %s (%s)",
-            vmeth.first->get_deobfuscated_name_or_empty().c_str(),
+            vmeth.first->get_deobfuscated_name_or_empty_copy().c_str(),
             SHOW(vmeth.first->get_name()));
-      intf_meths.methods.emplace_back(vmeth.first);
+      intf_meth.methods.emplace_back(vmeth.first);
+      inserted = true;
+    }
+
+    if (!inserted) {
+      return;
+    }
+
+    // An interface VirtualScope rooted from a mergeable needs to consider
+    // the interface method it implements. The interface method can be a
+    // default method or even an external default method.
+    // In the default method case, if it's not overridden by all mergeables,
+    // we need to identify the default method as the fall back.
+    // Here we check if the overridden interface is an external non-abstract
+    // class. If it is, we assume it's an external default method, and
+    // update MergerType.InterfaceMethod.overridden_method accordingly.
+    if (!intf_meth.overridden_meth) {
+      const auto& intfs = intf_scope.interfaces;
+      always_assert(!intfs.empty());
+      for (const auto* intf : intfs) {
+        const auto* intf_cls = type_class(intf);
+        always_assert(intf_cls);
+        const auto* meth = intf_meth.methods.front();
+        auto* intf_method = resolve_interface_method(intf_cls, meth->get_name(),
+                                                     meth->get_proto());
+        if (intf_method && !is_abstract(intf_method)) {
+          intf_meth.overridden_meth = intf_method;
+          TRACE(CLMG, 8, "Update InterfaceMethod.overridden_meth %s",
+                SHOW(intf_method));
+          break;
+        }
+      }
     }
   };
 
@@ -1107,7 +1185,7 @@ void Model::add_interface_scope(MergerType& merger,
   const auto& vmethod = intf_scope.methods[0];
   for (auto& intf_meths : merger.intfs_methods) {
     if (method::signatures_match(intf_meths.methods[0], vmethod.first)) {
-      insert(intf_meths);
+      insert_to(intf_meths);
       return;
     }
   }
@@ -1117,7 +1195,7 @@ void Model::add_interface_scope(MergerType& merger,
   // has at least one method def.
   if (intf_scope.has_def()) {
     merger.intfs_methods.push_back(MergerType::InterfaceMethod());
-    insert(merger.intfs_methods.back());
+    insert_to(merger.intfs_methods.back());
   }
 }
 
@@ -1132,7 +1210,9 @@ void Model::distribute_virtual_methods(
   const auto& class_scopes = m_type_system.get_class_scopes();
   const auto& virt_scopes = class_scopes.get(type);
   for (const auto& virt_scope : virt_scopes) {
-    if (virt_scope->methods.size() == 1) continue;
+    if (virt_scope->methods.size() == 1) {
+      continue;
+    }
     TRACE(CLMG,
           8,
           "virtual scope found [%ld] %s",
@@ -1141,9 +1221,10 @@ void Model::distribute_virtual_methods(
     base_scopes.emplace_back(virt_scope);
   }
 
-  const auto& merger = m_mergers.find(type);
-  if (merger != m_mergers.end() && !merger->second.mergeables.empty()) {
-    TRACE(CLMG, 8, "merger found %s", SHOW(merger->second.type));
+  const auto& merger_it = m_mergers.find(type);
+  if (merger_it != m_mergers.end() && !merger_it->second.mergeables.empty()) {
+    auto& merger = merger_it->second;
+    TRACE(CLMG, 8, "merger found %s", SHOW(merger.type));
     // loop through the parent scopes of the mergeable types and
     // if a method is from a mergeable type add it to the merger
     for (const auto& virt_scope : base_scopes) {
@@ -1153,59 +1234,84 @@ void Model::distribute_virtual_methods(
             SHOW(virt_scope->type),
             virt_scope->methods.size(),
             virt_scope->methods[0]
-                .first->get_deobfuscated_name_or_empty()
+                .first->get_deobfuscated_name_or_empty_copy()
                 .c_str(),
             SHOW(virt_scope->methods[0].first->get_name()));
       bool is_interface = !virt_scope->interfaces.empty();
       std::vector<DexMethod*>* insert_list = nullptr;
-      // TODO(zwei): currently we only handle overridden method resided in the
-      // based type. If we plan to support more complicated vertical hierarchy,
-      // we need to revise the logic here.
-      auto top_def = virt_scope->methods[0].first;
-      DexMethod* overridden_meth = top_def->is_def() ? top_def : nullptr;
-      for (const auto& vmeth : virt_scope->methods) {
-        if (!vmeth.first->is_def()) {
+      // If the top_def is concrete, it's a valid virtual fallback for
+      // mergeables w/o override. However, if the top_def is a non-def miranda,
+      // we need to keep probing the next def in the same virtual scope. At the
+      // same time, we need to make sure the overridden def we take is actually
+      // on a base class of the targeted mergeables, not on a separate
+      // inheritance branch.
+      // We commit on the 1st valid base impl as the virtual fallback, not the
+      // lowest one in the virtual scope. It's not necessary to go even lower,
+      // the emitted code is correct. Virtual method refs can be rebound at a
+      // later point.
+      auto top_def = virt_scope->methods[0];
+      DexMethod* overridden_meth =
+          top_def.first->is_def() ? top_def.first : nullptr;
+      const auto update_overridden = [&merger, &overridden_meth](
+                                         const VirtualMethod& top_def,
+                                         DexMethod* virt_meth) {
+        always_assert(virt_meth->is_def());
+        if (overridden_meth == nullptr && is_miranda(top_def.second)) {
+          const auto* cls = virt_meth->get_class();
+          const auto& mergeables = merger.mergeables;
+          always_assert(!mergeables.empty());
+          const auto* a_mergeable = *mergeables.begin();
+          if (type::is_subclass(cls, a_mergeable)) {
+            overridden_meth = virt_meth;
+            TRACE(CLMG, 9, "Update overridden_meth to %s for top_def %s",
+                  SHOW(virt_meth), SHOW(top_def.first));
+          }
+        }
+      };
+
+      for (const auto& pair : virt_scope->methods) {
+        auto* virt_meth = pair.first;
+        if (!virt_meth->is_def()) {
           continue;
         }
-        if (merger->second.mergeables.count(vmeth.first->get_class()) == 0) {
+        if (merger.mergeables.count(virt_meth->get_class()) == 0) {
+          update_overridden(virt_scope->methods[0], virt_meth);
           continue;
         }
         TRACE(CLMG,
               9,
               "method %s (%s)",
-              vmeth.first->get_deobfuscated_name_or_empty().c_str(),
-              SHOW(vmeth.first->get_name()));
+              virt_meth->get_deobfuscated_name_or_empty_copy().c_str(),
+              SHOW(virt_meth->get_name()));
         if (is_interface) {
           if (insert_list == nullptr) {
             // must be a new method
             TRACE(CLMG,
                   8,
                   "add interface method %s (%s) w/ overridden_meth %s",
-                  vmeth.first->get_deobfuscated_name_or_empty().c_str(),
-                  SHOW(vmeth.first->get_name()),
+                  virt_meth->get_deobfuscated_name_or_empty_copy().c_str(),
+                  SHOW(virt_meth->get_name()),
                   SHOW(overridden_meth));
-            merger->second.intfs_methods.push_back(
-                MergerType::InterfaceMethod());
-            auto& intf_meth = merger->second.intfs_methods.back();
+            merger.intfs_methods.push_back(MergerType::InterfaceMethod());
+            auto& intf_meth = merger.intfs_methods.back();
             intf_meth.overridden_meth = overridden_meth;
-            merger->second.intfs_methods.back().interfaces.insert(
+            merger.intfs_methods.back().interfaces.insert(
                 virt_scope->interfaces.begin(), virt_scope->interfaces.end());
-            insert_list = &merger->second.intfs_methods.back().methods;
+            insert_list = &merger.intfs_methods.back().methods;
           }
-          insert_list->emplace_back(vmeth.first);
+          insert_list->emplace_back(virt_meth);
         } else {
           if (insert_list == nullptr) {
             // must be a new method
             TRACE(CLMG,
                   8,
                   "add virtual method %s w/ overridden_meth %s",
-                  SHOW(vmeth.first),
+                  SHOW(virt_meth),
                   SHOW(overridden_meth));
-            merger->second.vmethods.emplace_back(overridden_meth,
-                                                 std::vector<DexMethod*>());
-            insert_list = &merger->second.vmethods.back().second;
+            merger.vmethods.emplace_back(overridden_meth);
+            insert_list = &merger.vmethods.back().overrides;
           }
-          insert_list->emplace_back(vmeth.first);
+          insert_list->emplace_back(virt_meth);
         }
       }
     }
@@ -1237,32 +1343,32 @@ std::string Model::print() const {
   return ss.str();
 }
 
-std::string Model::print(const MergerType* merger) const {
+std::string Model::print(const MergerType& merger) const {
   std::ostringstream ss;
-  ss << SHOW(merger->type) << " mergeables(" << merger->mergeables.size() << ")"
-     << " shape(str: " << merger->shape.string_fields
-     << ", refs: " << merger->shape.reference_fields
-     << ", bool: " << merger->shape.bool_fields
-     << ", int: " << merger->shape.int_fields
-     << ", long: " << merger->shape.long_fields
-     << ", double: " << merger->shape.double_fields
-     << ", float: " << merger->shape.float_fields << ") dmethods("
-     << merger->dmethods.size() << ") non_virt_methods("
-     << merger->non_virt_methods.size() << ") vmethods("
-     << merger->vmethods.size();
-  for (const auto& meths : merger->vmethods) {
-    ss << "[" << meths.second.size() << "]";
+  ss << SHOW(merger.type) << " mergeables(" << merger.mergeables.size() << ")"
+     << " shape(str: " << merger.shape.string_fields
+     << ", refs: " << merger.shape.reference_fields
+     << ", bool: " << merger.shape.bool_fields
+     << ", int: " << merger.shape.int_fields
+     << ", long: " << merger.shape.long_fields
+     << ", double: " << merger.shape.double_fields
+     << ", float: " << merger.shape.float_fields << ") dmethods("
+     << merger.dmethods.size() << ") non_virt_methods("
+     << merger.non_virt_methods.size() << ") vmethods("
+     << merger.vmethods.size();
+  for (const auto& meths : merger.vmethods) {
+    ss << "[" << meths.overrides.size() << "]";
   }
-  ss << ") intf_methods(" << merger->intfs_methods.size();
-  for (const auto& intf_meths : merger->intfs_methods) {
+  ss << ") intf_methods(" << merger.intfs_methods.size();
+  for (const auto& intf_meths : merger.intfs_methods) {
     ss << "[" << intf_meths.methods.size() << "]";
   }
   ss << ")";
-  const auto& children = m_hierarchy.find(merger->type);
+  const auto& children = m_hierarchy.find(merger.type);
   if (children != m_hierarchy.end()) {
     ss << " children(" << children->second.size() << ")";
   }
-  const auto& intfs = m_class_to_intfs.find(merger->type);
+  const auto& intfs = m_class_to_intfs.find(merger.type);
   if (intfs != m_class_to_intfs.end()) {
     ss << " interfaces(" << intfs->second.size() << ")";
     if (intfs->second.size() <= 7) {
@@ -1302,18 +1408,20 @@ std::string Model::print(const DexType* type, int nest) const {
     }
   };
 
-  const auto& merger = m_mergers.find(type);
+  const auto merger_it = m_mergers.find(type);
   indent('+');
   ss << " ";
-  if (merger != m_mergers.end()) {
-    ss << print(&merger->second);
+  if (merger_it != m_mergers.end()) {
+    const MergerType& merger = merger_it->second;
+    ss << print(merger);
   } else {
     ss << print(type);
   }
   ss << "\n";
 
-  if (merger != m_mergers.end()) {
-    for (const auto& mergeable : merger->second.mergeables) {
+  if (merger_it != m_mergers.end()) {
+    const MergerType& merger = merger_it->second;
+    for (const auto& mergeable : merger.mergeables) {
       indent('-');
       ss << " " << print(mergeable) << "\n";
       const auto cls = type_class(mergeable);
@@ -1324,53 +1432,68 @@ std::string Model::print(const DexType* type, int nest) const {
       }
     }
 
-    const auto meth_str = [&](const DexMethod* meth) {
+    const auto meth_str = [&](const DexMethod* meth,
+                              const std::string& suffix = "") {
       indent('-');
-      ss << "# " << show_deobfuscated(meth) << " (" << meth->get_name()->c_str()
-         << ") [" << meth->get_code()->count_opcodes() << "]\n";
+      if (meth) {
+        ss << "# " << show_deobfuscated(meth) << " ("
+           << meth->get_name()->c_str() << ") ["
+           << (meth->get_code() ? meth->get_code()->count_opcodes() : 0) << "]";
+      } else {
+        ss << "# missing";
+      }
+      ss << (suffix.empty() ? "" : " (") << suffix << ")\n";
     };
 
-    if (!merger->second.dmethods.empty()) {
+    if (!merger_it->second.dmethods.empty()) {
       indent('-');
-      ss << "# " << merger->second.dmethods.size() << " dmethods:\n";
-      for (const auto& meth : merger->second.dmethods) {
+      ss << "# " << merger.dmethods.size() << " dmethods:\n";
+      for (const auto* meth : merger.dmethods) {
         meth_str(meth);
       }
     }
 
-    if (!merger->second.non_virt_methods.empty()) {
+    if (!merger_it->second.non_virt_methods.empty()) {
       indent('-');
-      ss << "# " << merger->second.non_virt_methods.size()
-         << " non virtual methods:\n";
-      for (const auto& meth : merger->second.non_virt_methods) {
+      ss << "# " << merger.non_virt_methods.size() << " non virtual methods:\n";
+      for (const auto* meth : merger_it->second.non_virt_methods) {
         meth_str(meth);
       }
     }
 
-    if (!merger->second.vmethods.empty()) {
+    if (!merger.vmethods.empty()) {
       indent('-');
-      ss << "# " << merger->second.vmethods.size() << " virtual methods:\n";
-      for (const auto& vmeths : merger->second.vmethods) {
-        for (const auto& meth : vmeths.second) {
+      ss << "# " << merger.vmethods.size() << " virtual methods:\n";
+      for (const auto& vmeths : merger.vmethods) {
+        meth_str(vmeths.base, "base");
+        for (const auto* meth : vmeths.overrides) {
           meth_str(meth);
         }
       }
     }
 
-    if (!merger->second.intfs_methods.empty()) {
+    if (!merger_it->second.intfs_methods.empty()) {
       indent('-');
-      ss << "# " << merger->second.intfs_methods.size()
-         << " interface methods:\n";
-      for (const auto& intf_meths : merger->second.intfs_methods) {
-        for (const auto& meth : intf_meths.methods) {
+      ss << "# " << merger.intfs_methods.size() << " interface methods:\n";
+      for (const auto& intf_meths : merger.intfs_methods) {
+        meth_str(intf_meths.overridden_meth, "overridden");
+        for (const auto* meth : intf_meths.methods) {
           meth_str(meth);
+        }
+        if (merger.mergeables.size() > intf_meths.methods.size()) {
+          if (!intf_meths.overridden_meth) {
+            const auto& methods = intf_meths.methods;
+            TRACE(CLMG, 8,
+                  "interface method entry missing overridden method %s %ld",
+                  SHOW(methods.front()), methods.size());
+          }
         }
       }
     }
   }
   const auto& children = m_hierarchy.find(type);
   if (children != m_hierarchy.end()) {
-    for (const auto& child : children->second) {
+    for (const auto* child : children->second) {
       ss << print(child, nest + 1);
     }
   }

@@ -98,19 +98,16 @@ class PatriciaTreeMapAbstractEnvironment final
 
   PatriciaTreeMapAbstractEnvironment& set(const Variable& variable,
                                           const Domain& value) {
-    if (this->is_bottom()) {
-      return *this;
-    }
-    if (value.is_bottom()) {
-      this->set_to_bottom();
-      return *this;
-    }
-    this->get_value()->insert_binding(variable, value);
-    this->normalize();
-    return *this;
+    return set_internal(variable, value);
   }
 
-  bool map(std::function<Domain(const Domain&)> f) {
+  PatriciaTreeMapAbstractEnvironment& set(const Variable& variable,
+                                          Domain&& value) {
+    return set_internal(variable, std::move(value));
+  }
+
+  template <typename Operation> // Domain(const Domain&)
+  bool map(Operation f) {
     if (this->is_bottom()) {
       return false;
     }
@@ -137,9 +134,9 @@ class PatriciaTreeMapAbstractEnvironment final
     return *this;
   }
 
-  PatriciaTreeMapAbstractEnvironment& update(
-      const Variable& variable,
-      std::function<Domain(const Domain&)> operation) {
+  template <typename Operation> // Domain(const Domain&)
+  PatriciaTreeMapAbstractEnvironment& update(const Variable& variable,
+                                             Operation&& operation) {
     if (this->is_bottom()) {
       return *this;
     }
@@ -166,6 +163,22 @@ class PatriciaTreeMapAbstractEnvironment final
 
   static PatriciaTreeMapAbstractEnvironment top() {
     return PatriciaTreeMapAbstractEnvironment(AbstractValueKind::Top);
+  }
+
+ private:
+  template <typename D>
+  PatriciaTreeMapAbstractEnvironment& set_internal(const Variable& variable,
+                                                   D&& value) {
+    if (this->is_bottom()) {
+      return *this;
+    }
+    if (value.is_bottom()) {
+      this->set_to_bottom();
+      return *this;
+    }
+    this->get_value()->insert_binding(variable, std::forward<D>(value));
+    this->normalize();
+    return *this;
   }
 };
 
@@ -226,8 +239,8 @@ class MapValue final : public AbstractValue<MapValue<Variable, Domain>> {
 
   MapValue() = default;
 
-  MapValue(const Variable& variable, const Domain& value) {
-    insert_binding(variable, value);
+  MapValue(const Variable& variable, Domain value) {
+    insert_binding(variable, std::move(value));
   }
 
   void clear() override { m_map.clear(); }
@@ -267,28 +280,31 @@ class MapValue final : public AbstractValue<MapValue<Variable, Domain>> {
   }
 
  private:
-  void insert_binding(const Variable& variable, const Domain& value) {
+  void insert_binding(const Variable& variable, Domain value) {
     // The Bottom value is handled by the caller and should never occur here.
     RUNTIME_CHECK(!value.is_bottom(), internal_error());
-    m_map.insert_or_assign(variable, value);
+    m_map.insert_or_assign(variable, std::move(value));
   }
 
-  bool map(std::function<Domain(const Domain&)>& f) { return m_map.map(f); }
+  template <typename Operation> // Domain(const Domain&)
+  bool map(Operation&& f) {
+    return m_map.map(f);
+  }
 
   bool erase_all_matching(const Variable& variable_mask) {
     return m_map.erase_all_matching(variable_mask);
   }
 
-  AbstractValueKind join_like_operation(
-      const MapValue& other,
-      std::function<Domain(const Domain&, const Domain&)> operation) {
+  template <typename Operation> // Domain(const Domain&, const Domain&)
+  AbstractValueKind join_like_operation(const MapValue& other,
+                                        Operation&& operation) {
     m_map.intersection_with(operation, other.m_map);
     return kind();
   }
 
-  AbstractValueKind meet_like_operation(
-      const MapValue& other,
-      std::function<Domain(const Domain&, const Domain&)> operation) {
+  template <typename Operation> // Domain(const Domain&, const Domain&)
+  AbstractValueKind meet_like_operation(const MapValue& other,
+                                        Operation&& operation) {
     try {
       m_map.union_with(
           [&operation](const Domain& x, const Domain& y) {

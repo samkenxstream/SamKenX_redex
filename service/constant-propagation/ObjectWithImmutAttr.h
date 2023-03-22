@@ -254,6 +254,27 @@ struct ObjectWithImmutAttr {
     return true;
   }
 
+  bool leq(const ObjectWithImmutAttr& other) const {
+    redex_assert(type == other.type);
+    if (jvm_cached_singleton && !other.jvm_cached_singleton) {
+      return false;
+    }
+    if (attributes.size() > other.attributes.size()) {
+      return false;
+    }
+    for (size_t idx = 0; idx < attributes.size(); idx++) {
+      auto& attr1 = attributes[idx];
+      const auto& attr2 = other.attributes[idx];
+      if (attr1.attr != attr2.attr) {
+        return false;
+      }
+      if (!attr1.value.leq(attr2.value)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
   void join_with(const ObjectWithImmutAttr& other) {
     redex_assert(type == other.type);
     bool is_all_constant = true;
@@ -265,6 +286,16 @@ struct ObjectWithImmutAttr {
     }
     jvm_cached_singleton =
         jvm_cached_singleton && other.jvm_cached_singleton && is_all_constant;
+  }
+
+  void meet_with(const ObjectWithImmutAttr& other) {
+    redex_assert(type == other.type);
+    for (size_t idx = 0; idx < attributes.size(); idx++) {
+      auto& attr1 = attributes[idx];
+      const auto& attr2 = other.attributes[idx];
+      attr1.value.meet_with(attr2.value);
+    }
+    jvm_cached_singleton &= other.jvm_cached_singleton;
   }
 
   bool operator==(const ObjectWithImmutAttr& other) const {
@@ -357,9 +388,32 @@ class ObjectWithImmutAttrDomain final
   ObjectWithImmutAttrDomain() { this->set_to_top(); }
 
   explicit ObjectWithImmutAttrDomain(ObjectWithImmutAttr&& obj)
-      : m_kind(sparta::AbstractValueKind::Value), m_value(std::move(obj)) {}
+      : m_kind(sparta::AbstractValueKind::Value),
+        m_value(std::make_unique<ObjectWithImmutAttr>(std::move(obj))) {}
 
-  boost::optional<ObjectWithImmutAttr> get_constant() const { return m_value; }
+  ObjectWithImmutAttrDomain(const ObjectWithImmutAttrDomain& other) {
+    m_kind = other.m_kind;
+    if (other.m_value) {
+      m_value = std::make_unique<ObjectWithImmutAttr>(*other.m_value);
+    }
+  }
+
+  ObjectWithImmutAttrDomain(ObjectWithImmutAttrDomain&& other) = default;
+
+  ObjectWithImmutAttrDomain& operator=(const ObjectWithImmutAttrDomain& other) {
+    m_kind = other.m_kind;
+    if (other.m_value) {
+      m_value = std::make_unique<ObjectWithImmutAttr>(*other.m_value);
+    }
+    return *this;
+  }
+
+  ObjectWithImmutAttrDomain& operator=(ObjectWithImmutAttrDomain&& other) =
+      default;
+
+  boost::optional<ObjectWithImmutAttr> get_constant() const {
+    return m_value ? boost::make_optional(*m_value) : boost::none;
+  }
 
   bool is_bottom() const override {
     return m_kind == sparta::AbstractValueKind::Bottom;
@@ -373,16 +427,25 @@ class ObjectWithImmutAttrDomain final
 
   void set_to_bottom() override {
     m_kind = sparta::AbstractValueKind::Bottom;
-    m_value = boost::none;
+    m_value = nullptr;
   }
 
   void set_to_top() override {
     m_kind = sparta::AbstractValueKind::Top;
-    m_value = boost::none;
+    m_value = nullptr;
   }
 
   bool leq(const ObjectWithImmutAttrDomain& other) const override {
-    return equals(other);
+    if (is_bottom()) {
+      return true;
+    }
+    if (is_top()) {
+      return other.is_top();
+    }
+    if (other.is_top()) {
+      return true;
+    }
+    return m_value->leq(*other.m_value);
   }
 
   bool equals(const ObjectWithImmutAttrDomain& other) const override {
@@ -408,7 +471,7 @@ class ObjectWithImmutAttrDomain final
     }
     if (is_bottom()) {
       m_kind = other.m_kind;
-      m_value = other.m_value;
+      m_value = std::make_unique<ObjectWithImmutAttr>(*other.m_value);
       return;
     }
     if (m_value->same_attrs(*other.m_value)) {
@@ -432,7 +495,7 @@ class ObjectWithImmutAttrDomain final
     }
     if (is_top()) {
       m_kind = other.m_kind;
-      m_value = other.m_value;
+      m_value = std::make_unique<ObjectWithImmutAttr>(*other.m_value);
       return;
     }
     auto equality = m_value->runtime_equals(*other.m_value);
@@ -441,6 +504,17 @@ class ObjectWithImmutAttrDomain final
     } else if (equality == TriState::False) {
       set_to_bottom();
     } else {
+      always_assert(equality == TriState::Unknown);
+      if (m_value->same_attrs(*other.m_value)) {
+        m_value->meet_with(*other.m_value);
+        for (auto& attr : m_value->attributes) {
+          if (attr.value.is_bottom()) {
+            set_to_bottom();
+            return;
+          }
+        }
+        return;
+      }
       set_to_top();
     }
   }
@@ -471,5 +545,5 @@ class ObjectWithImmutAttrDomain final
 
  private:
   sparta::AbstractValueKind m_kind;
-  boost::optional<ObjectWithImmutAttr> m_value;
+  std::unique_ptr<ObjectWithImmutAttr> m_value;
 };

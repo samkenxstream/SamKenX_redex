@@ -128,6 +128,55 @@ void RootSetMarker::mark(const Scope& scope) {
   mark_external_method_overriders();
 }
 
+void RootSetMarker::mark_with_exclusions(
+    const Scope& scope,
+    const ConcurrentSet<const DexClass*>& excluded_classes,
+    const ConcurrentSet<const DexMethod*>& excluded_methods) {
+  auto excluded = [&excluded_classes, &excluded_methods](auto* item) -> bool {
+    if constexpr (std::is_same_v<decltype(item), const DexClass*>) {
+      return excluded_classes.find(item) != excluded_classes.end();
+    } else if constexpr (std::is_same_v<decltype(item), const DexMethod*>) {
+      return excluded_methods.find(item) != excluded_methods.end();
+    } else {
+      static_assert(std::is_same_v<decltype(item), const DexField*>);
+      return false;
+    }
+  };
+
+  walk::parallel::classes(scope, [&](const DexClass* cls) {
+    if (should_mark_cls(cls) && !excluded(cls)) {
+      TRACE(REACH, 3, "Visiting seed: %s", SHOW(cls));
+      push_seed(cls);
+    }
+    for (const auto* f : cls->get_ifields()) {
+      if ((root(f) || is_volatile(f)) && !excluded(f)) {
+        TRACE(REACH, 3, "Visiting seed: %s", SHOW(f));
+        push_seed(f);
+      }
+    }
+    for (const auto* f : cls->get_sfields()) {
+      if (root(f) && !excluded(f)) {
+        TRACE(REACH, 3, "Visiting seed: %s", SHOW(f));
+        push_seed(f);
+      }
+    }
+    for (const auto* m : cls->get_dmethods()) {
+      if (root(m) && !excluded(m)) {
+        TRACE(REACH, 3, "Visiting seed: %s", SHOW(m));
+        push_seed(m);
+      }
+    }
+    for (const auto* m : cls->get_vmethods()) {
+      if (root(m) && !excluded(m)) {
+        TRACE(REACH, 3, "Visiting seed: %s (root)", SHOW(m));
+        push_seed(m);
+      }
+    }
+  });
+
+  mark_external_method_overriders();
+}
+
 void RootSetMarker::push_seed(const DexClass* cls) {
   if (!cls) return;
   record_is_seed(cls);
@@ -368,8 +417,8 @@ template <class Parent>
 void TransitiveClosureMarker::push_typelike_strings(
     const Parent* parent, const std::vector<const DexString*>& strings) {
   for (auto const& str : strings) {
-    auto internal = java_names::external_to_internal(str->c_str());
-    auto type = DexType::get_type(internal.c_str());
+    auto internal = java_names::external_to_internal(str->str());
+    auto type = DexType::get_type(internal);
     if (!type) {
       continue;
     }
@@ -381,16 +430,16 @@ void TransitiveClosureMarker::visit_cls(const DexClass* cls) {
   TRACE(REACH, 4, "Visiting class: %s", SHOW(cls));
   for (auto& m : cls->get_dmethods()) {
     if (method::is_clinit(m)) {
-      push(cls, m);
-    } else if (method::is_init(m)) {
+      if (!m->get_code() || !method::is_trivial_clinit(*m->get_code())) {
+        push(cls, m);
+      }
+    } else if (!m_remove_no_argument_constructors &&
+               method::is_argless_init(m)) {
       // Push the parameterless constructor, in case it's constructed via
       // .class or Class.forName()
       // if m_remove_no_argument_constructors, make an exception. This is only
       // used for testing
-      if (!m_remove_no_argument_constructors &&
-          m->get_proto()->get_args()->empty()) {
-        push(cls, m);
-      }
+      push(cls, m);
     }
   }
   push(cls, type_class(cls->get_super_class()));
@@ -658,30 +707,51 @@ static void sweep_if_unmarked(const ReachableObjects& reachables,
 
 void sweep(DexStoresVector& stores,
            const ReachableObjects& reachables,
-           ConcurrentSet<std::string>* removed_symbols) {
+           ConcurrentSet<std::string>* removed_symbols,
+           bool output_full_removed_symbols) {
   Timer t("Sweep");
+  auto scope = build_class_scope(stores);
+
+  std::unordered_set<DexClass*> sweeped_classes;
   for (auto& dex : DexStoreClassesIterator(stores)) {
     sweep_if_unmarked(
-        reachables, [](auto c) {}, &dex, removed_symbols);
-
-    auto sweep_method = [&](DexMethodRef* m) {
-      if (m->is_def()) {
-        m->as_def()->release_code(); // Free code.
-      }
-      DexMethod::erase_method(m);
-    };
-
-    walk::parallel::classes(dex, [&](DexClass* cls) {
-      sweep_if_unmarked(reachables, DexField::delete_field_DO_NOT_USE,
-                        &cls->get_ifields(), removed_symbols);
-      sweep_if_unmarked(reachables, DexField::delete_field_DO_NOT_USE,
-                        &cls->get_sfields(), removed_symbols);
-      sweep_if_unmarked(reachables, sweep_method, &cls->get_dmethods(),
-                        removed_symbols);
-      sweep_if_unmarked(reachables, sweep_method, &cls->get_vmethods(),
-                        removed_symbols);
-    });
+        reachables, [&](auto cls) { sweeped_classes.insert(cls); }, &dex,
+        removed_symbols);
   }
+
+  auto sweep_method = [&](DexMethodRef* m) {
+    DexMethod::erase_method(m);
+    if (m->is_def()) {
+      DexMethod::delete_method(m->as_def());
+    }
+  };
+
+  walk::parallel::classes(scope, [&](DexClass* cls) {
+    if (sweeped_classes.count(cls)) {
+      for (auto field : cls->get_all_fields()) {
+        DexField::delete_field_DO_NOT_USE(field);
+      }
+      cls->get_ifields().clear();
+      cls->get_sfields().clear();
+      for (auto method : cls->get_all_methods()) {
+        if (removed_symbols && output_full_removed_symbols) {
+          removed_symbols->insert(show_deobfuscated(method));
+        }
+        sweep_method(method);
+      }
+      cls->get_dmethods().clear();
+      cls->get_vmethods().clear();
+      return;
+    }
+    sweep_if_unmarked(reachables, DexField::delete_field_DO_NOT_USE,
+                      &cls->get_ifields(), removed_symbols);
+    sweep_if_unmarked(reachables, DexField::delete_field_DO_NOT_USE,
+                      &cls->get_sfields(), removed_symbols);
+    sweep_if_unmarked(reachables, sweep_method, &cls->get_dmethods(),
+                      removed_symbols);
+    sweep_if_unmarked(reachables, sweep_method, &cls->get_vmethods(),
+                      removed_symbols);
+  });
 }
 
 ObjectCounts count_objects(const DexStoresVector& stores) {

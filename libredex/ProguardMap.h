@@ -8,7 +8,7 @@
 #pragma once
 
 #include <cstddef>
-#include <fstream>
+#include <iosfwd>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -120,6 +120,7 @@ struct ProguardMap {
   bool parse_method(const std::string& line);
 
   bool parse_class_full_format(const std::string& line);
+  bool parse_store_full_format(const std::string& line);
   bool parse_field_full_format(const std::string& line);
   bool parse_method_full_format(const std::string& line);
 
@@ -166,7 +167,7 @@ const DexString* file_name_from_method_string(const DexString* method);
 
 void apply_deobfuscated_positions(IRCode*, const ProguardMap&);
 
-std::string lines_key(const std::string& method_name);
+std::string_view lines_key(const std::string_view method_name);
 
 } // namespace pg_impl
 
@@ -176,5 +177,4 @@ std::string lines_key(const std::string& method_name);
  *   void -> V
  *   java.util.ArrayList[][] -> [[Ljava/util/ArrayList;
  */
-std::string convert_type(const std::string&);
 std::string convert_type(std::string_view);

@@ -215,7 +215,7 @@ struct OptimizationImpl {
   // list of optimized types
   std::unordered_set<DexType*> optimized;
   const ClassHierarchy& ch;
-  std::unordered_map<std::string, size_t> deobfuscated_name_counters;
+  std::unordered_map<std::string_view, size_t> deobfuscated_name_counters;
 };
 
 /**
@@ -413,6 +413,12 @@ CheckCastSet OptimizationImpl::fix_instructions(const DexType* intf,
             continue;
           }
 
+          // Return.
+          if (opcode::is_return_object(insn->opcode())) {
+            reg_t casted = add_check_cast(insn->src(0));
+            insn->set_src(0, casted);
+          }
+
           // Others do not need fixup.
         }
       },
@@ -477,7 +483,7 @@ void OptimizationImpl::rewrite_interface_methods(const DexType* intf,
       // have these zombies lying around.
       new_meth->clear_annotations();
       new_meth->make_non_concrete();
-      auto deoob_impl_name = impl->get_deobfuscated_name_or_empty();
+      const auto deoob_impl_name = impl->get_deobfuscated_name_or_empty();
       auto unique = deobfuscated_name_counters[deoob_impl_name]++;
       auto new_deob_name = deoob_impl_name + "." +
                            meth->get_simple_deobfuscated_name() +
@@ -797,7 +803,11 @@ check_casts::impl::Stats OptimizationImpl::post_process(
         auto code = m->get_code();
         always_assert(!code->editable_cfg_built());
         cfg::ScopedCFG cfg(code);
-        check_casts::CheckCastConfig config;
+        // T131253060 If enable weaken, we are hitting an assertion in
+        // CheckCastAnalysis where a definition of a value is unknown. This only
+        // occurs here within SingleImplPass, but not in subsequent
+        // CheckCastRemovals where weaken is enabled by default.
+        check_casts::CheckCastConfig config{.weaken = false};
         check_casts::impl::CheckCastAnalysis analysis(config, m);
         auto casts = analysis.collect_redundant_checks_replacement();
         auto local_stats = check_casts::impl::apply(m, casts);

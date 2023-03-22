@@ -60,7 +60,7 @@ RemoveUninstantiablesPass::Stats replace_all_with_throw(
     const auto expected_ir = assembler::ircode_from_string(EXPECTED); \
                                                                       \
     actual_ir->build_cfg();                                           \
-    STATS += OPERATION(actual_ir->cfg());                             \
+    (STATS) += (OPERATION)(actual_ir->cfg());                         \
     actual_ir->clear_cfg();                                           \
                                                                       \
     EXPECT_CODE_EQ(expected_ir.get(), actual_ir.get());               \
@@ -511,6 +511,41 @@ TEST_F(RemoveUninstantiablesTest, GetUninstantiable) {
   EXPECT_EQ(2, stats.get_uninstantiables);
 }
 
+TEST_F(RemoveUninstantiablesTest, InvokeUninstantiable) {
+  def_class("LFoo;");
+  def_class("LBar;", Bar_init);
+
+  DexMethod::make_method("LBar;.sFoo:()LFoo;")
+      ->make_concrete(ACC_PUBLIC | ACC_STATIC | ACC_NATIVE,
+                      /* is_virtual */ false);
+
+  DexMethod::make_method("LBar;.sBar:()LBar;")
+      ->make_concrete(ACC_PUBLIC | ACC_STATIC | ACC_NATIVE,
+                      /* is_virtual */ false);
+
+  ASSERT_TRUE(type::is_uninstantiable_class(DexType::get_type("LFoo;")));
+  ASSERT_FALSE(type::is_uninstantiable_class(DexType::get_type("LBar;")));
+
+  RemoveUninstantiablesPass::Stats stats;
+  EXPECT_CHANGE(replace_uninstantiable_refs,
+                stats,
+                /* ACTUAL */ R"((
+                  (invoke-static () "LBar.sFoo:()LFoo;")
+                  (move-result v0)
+                  (invoke-static () "LBar.sBar:()LBar;")
+                  (move-result v1)
+                  (return-void)
+                ))",
+                /* EXPECTED */ R"((
+                  (invoke-static () "LBar.sFoo:()LFoo;")
+                  (const v0 0)
+                  (invoke-static () "LBar.sBar:()LBar;")
+                  (move-result v1)
+                  (return-void)
+                ))");
+  EXPECT_EQ(1, stats.invoke_uninstantiables);
+}
+
 TEST_F(RemoveUninstantiablesTest, ReplaceAllWithThrow) {
   RemoveUninstantiablesPass::Stats stats;
   EXPECT_CHANGE(replace_all_with_throw,
@@ -549,6 +584,7 @@ TEST_F(RemoveUninstantiablesTest, RunPass) {
   PassManager pm({&pass});
 
   ConfigFiles c(Json::nullValue);
+  c.parse_global_config();
   pm.run_passes(dss, c);
 
   EXPECT_ABSTRACT_METHOD("LFoo;.baz:()V");
@@ -742,6 +778,7 @@ TEST_F(RemoveUninstantiablesTest, RunPassInstantiableChildrenDefined) {
   PassManager pm({&pass});
 
   ConfigFiles c(Json::nullValue);
+  c.parse_global_config();
   pm.run_passes(dss, c);
 
   EXPECT_ABSTRACT_METHOD("LBar;.baz:()V");

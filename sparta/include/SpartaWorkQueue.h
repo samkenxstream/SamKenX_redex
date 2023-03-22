@@ -10,14 +10,15 @@
 #include <algorithm>
 #include <atomic>
 #include <boost/optional/optional.hpp>
-#include <boost/thread/thread.hpp>
 #include <cassert>
 #include <chrono>
 #include <condition_variable>
+#include <exception>
 #include <mutex>
 #include <numeric>
 #include <queue>
 #include <random>
+#include <thread>
 #include <utility>
 
 #include "Arity.h"
@@ -30,7 +31,7 @@ namespace parallel {
  * Sparta uses the number of physical cores.
  */
 static inline unsigned int default_num_threads() {
-  unsigned int threads = boost::thread::physical_concurrency();
+  unsigned int threads = std::thread::hardware_concurrency();
   return std::max(1u, threads);
 }
 
@@ -134,7 +135,7 @@ class SpartaWorkerState final {
     if (m_state_counters->num_running < m_state_counters->num_all) {
       m_state_counters->waiter->give(1u); // May consider waking all.
     }
-    m_queue.push(task);
+    m_queue.push(std::move(task));
   }
 
   size_t worker_id() const { return m_id; }
@@ -160,7 +161,7 @@ class SpartaWorkerState final {
       }
       auto task = std::move(m_queue.front());
       m_queue.pop();
-      return task;
+      return boost::optional<Input>(std::move(task));
     }
     return boost::none;
   }
@@ -188,10 +189,6 @@ class SpartaWorkQueue {
   workqueue_impl::StateCounters m_state_counters;
   const bool m_can_push_task{false};
 
-  void consume(SpartaWorkerState<Input>* state, Input task) {
-    m_executor(state, task);
-  }
-
  public:
   SpartaWorkQueue(Executor,
                   unsigned int num_threads = parallel::default_num_threads(),
@@ -209,6 +206,7 @@ class SpartaWorkQueue {
   // moves are allowed
   SpartaWorkQueue(SpartaWorkQueue&&) = default;
 
+  /* Adds (a copy of) an item to a pseudo-random worker. */
   void add_item(Input task);
 
   /* Add an item on the queue of the given worker. */
@@ -242,13 +240,13 @@ template <class Input, typename Executor>
 void SpartaWorkQueue<Input, Executor>::add_item(Input task) {
   m_insert_idx = (m_insert_idx + 1) % m_num_threads;
   assert(m_insert_idx < m_states.size());
-  m_states[m_insert_idx]->m_queue.push(task);
+  m_states[m_insert_idx]->m_queue.push(std::move(task));
 }
 
 template <class Input, typename Executor>
 void SpartaWorkQueue<Input, Executor>::add_item(Input task, size_t worker_id) {
   assert(worker_id < m_states.size());
-  m_states[worker_id]->m_queue.push(task);
+  m_states[worker_id]->m_queue.push(std::move(task));
 }
 
 /*
@@ -260,41 +258,68 @@ void SpartaWorkQueue<Input, Executor>::run_all() {
   m_state_counters.num_non_empty = 0;
   m_state_counters.num_running = 0;
   m_state_counters.waiter->take_all();
+  std::mutex exception_mutex;
+  std::exception_ptr exception;
   auto worker = [&](SpartaWorkerState<Input>* state, size_t state_idx) {
-    auto attempts =
-        workqueue_impl::create_permutation(m_num_threads, state_idx);
-    while (true) {
-      auto have_task = false;
-      for (auto idx : attempts) {
+    try {
+      auto attempts =
+          workqueue_impl::create_permutation(m_num_threads, state_idx);
+      while (true) {
+        auto have_task = false;
+        for (auto idx : attempts) {
+          auto other_state = m_states[idx].get();
+          auto task = other_state->pop_task(state);
+          if (task) {
+            have_task = true;
+            m_executor(state, std::move(*task));
+            break;
+          }
+        }
+        if (have_task) {
+          continue;
+        }
+
+        state->set_running(false);
+        if (!m_can_push_task) {
+          // New tasks can't be added. We don't need to wait for the currently
+          // running jobs to finish.
+          return;
+        }
+
+        // Let the thread quit if all the threads are not running and there
+        // is no task in any queue.
+        if (m_state_counters.num_running == 0 &&
+            m_state_counters.num_non_empty == 0) {
+          // Wake up everyone who might be waiting, so they can quit.
+          m_state_counters.waiter->give(m_state_counters.num_all);
+          return;
+        }
+
+        m_state_counters.waiter->take(); // Wait for work.
+      }
+    } catch (...) {
+      {
+        std::unique_lock<std::mutex> lock(exception_mutex);
+        if (exception) {
+          // An exception was already caught.
+          state->set_running(false);
+          return;
+        }
+        exception = std::current_exception();
+      }
+
+      // Make all other threads stop gracefully, by stealing their tasks.
+      for (unsigned int idx = 0; idx < m_num_threads; idx++) {
         auto other_state = m_states[idx].get();
-        auto task = other_state->pop_task(state);
-        if (task) {
-          have_task = true;
-          consume(state, *task);
-          break;
+        while (true) {
+          auto task = other_state->pop_task(state);
+          if (!task) {
+            break;
+          }
         }
       }
-      if (have_task) {
-        continue;
-      }
-
       state->set_running(false);
-      if (!m_can_push_task) {
-        // New tasks can't be added. We don't need to wait for the currently
-        // running jobs to finish.
-        return;
-      }
-
-      // Let the thread quit if all the threads are not running and there
-      // is no task in any queue.
-      if (m_state_counters.num_running == 0 &&
-          m_state_counters.num_non_empty == 0) {
-        // Wake up everyone who might be waiting, so they can quit.
-        m_state_counters.waiter->give(m_state_counters.num_all);
-        return;
-      }
-
-      m_state_counters.waiter->take(); // Wait for work.
+      m_state_counters.waiter->give(m_state_counters.num_all);
     }
   };
 
@@ -304,17 +329,22 @@ void SpartaWorkQueue<Input, Executor>::run_all() {
     }
   }
 
-  std::vector<boost::thread> all_threads;
+  std::vector<std::thread> all_threads;
   all_threads.reserve(m_num_threads);
   for (size_t i = 0; i < m_num_threads; ++i) {
-    boost::thread::attributes attrs;
-    attrs.set_stack_size(8 * 1024 * 1024);
-    all_threads.emplace_back(attrs,
-                             std::bind<void>(worker, m_states[i].get(), i));
+    all_threads.emplace_back(std::bind<void>(worker, m_states[i].get(), i));
   }
 
   for (auto& thread : all_threads) {
     thread.join();
+  }
+
+  for (size_t i = 0; i < m_num_threads; ++i) {
+    assert(!m_states[i]->m_running);
+  }
+
+  if (exception) {
+    std::rethrow_exception(exception);
   }
 
   for (size_t i = 0; i < m_num_threads; ++i) {
@@ -327,12 +357,14 @@ namespace workqueue_impl {
 template <typename Input, typename Fn>
 struct NoStateWorkQueueHelper {
   Fn fn;
-  void operator()(SpartaWorkerState<Input>*, Input a) { fn(a); }
+  void operator()(SpartaWorkerState<Input>*, Input a) { fn(std::move(a)); }
 };
 template <typename Input, typename Fn>
 struct WithStateWorkQueueHelper {
   Fn fn;
-  void operator()(SpartaWorkerState<Input>* state, Input a) { fn(state, a); }
+  void operator()(SpartaWorkerState<Input>* state, Input a) {
+    fn(state, std::move(a));
+  }
 };
 } // namespace workqueue_impl
 

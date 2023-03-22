@@ -63,6 +63,9 @@ class ReferencedState {
     bool m_set_allowobfuscation : 1;
     bool m_unset_allowobfuscation : 1;
 
+    // For keep modifier: -keep,includedescriptorclasses
+    bool m_includedescriptorclasses : 1;
+
     bool m_no_optimizations : 1;
 
     bool m_generated : 1;
@@ -99,6 +102,8 @@ class ReferencedState {
     // side effects.
     bool m_clinit_has_no_side_effects : 1;
 
+    bool m_too_large_for_inlining_into : 1;
+
     InnerStruct() {
       // Initializers in bit fields are C++20...
       m_by_string = false;
@@ -113,6 +118,8 @@ class ReferencedState {
       m_unset_allowshrinking = false;
       m_set_allowobfuscation = false;
       m_unset_allowobfuscation = false;
+
+      m_includedescriptorclasses = false;
 
       m_no_optimizations = false;
 
@@ -130,6 +137,7 @@ class ReferencedState {
 
       m_init_class = false;
       m_clinit_has_no_side_effects = false;
+      m_too_large_for_inlining_into = false;
     }
   } inner_struct;
 
@@ -193,6 +201,10 @@ class ReferencedState {
       this->inner_struct.m_unset_allowobfuscation =
           this->inner_struct.m_unset_allowobfuscation |
           other.inner_struct.m_unset_allowobfuscation;
+
+      this->inner_struct.m_includedescriptorclasses =
+          this->inner_struct.m_includedescriptorclasses |
+          other.inner_struct.m_includedescriptorclasses;
 
       this->inner_struct.m_no_optimizations =
           this->inner_struct.m_no_optimizations |
@@ -365,6 +377,7 @@ class ReferencedState {
 
   bool no_optimizations() const { return inner_struct.m_no_optimizations; }
   void set_no_optimizations() { inner_struct.m_no_optimizations = true; }
+  void reset_no_optimizations() { inner_struct.m_no_optimizations = false; }
 
   // Methods and classes marked as "generated" tend to not have stable names,
   // and don't properly participate in coldstart tracking.
@@ -398,6 +411,13 @@ class ReferencedState {
   }
   bool clinit_has_no_side_effects() const {
     return inner_struct.m_clinit_has_no_side_effects;
+  }
+
+  void set_too_large_for_inlining_into() {
+    inner_struct.m_too_large_for_inlining_into = true;
+  }
+  bool too_large_for_inlining_into() const {
+    return inner_struct.m_too_large_for_inlining_into;
   }
 
  private:
@@ -437,6 +457,14 @@ class ReferencedState {
 
   void unset_allowobfuscation() {
     inner_struct.m_unset_allowobfuscation = true;
+  }
+
+  bool includedescriptorclasses() const {
+    return inner_struct.m_includedescriptorclasses;
+  }
+
+  void set_includedescriptorclasses() {
+    inner_struct.m_includedescriptorclasses = true;
   }
 
   KeepReasons& ensure_keep_reasons() const {

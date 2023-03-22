@@ -11,6 +11,7 @@
 #include <boost/none.hpp>
 #include <boost/none_t.hpp>
 #include <boost/optional/optional.hpp>
+#include <fstream>
 #include <sstream>
 #include <string>
 
@@ -314,6 +315,7 @@ unsigned AppModuleUsagePass::gather_violations(
     const app_module_usage::MethodStoresReferenced& method_store_refs,
     const ConcurrentMap<DexField*, DexStore*>& field_store_refs,
     app_module_usage::Violations& violations) const {
+  int trace_level = m_crash_with_violations ? 0 : 1;
 
   unsigned n_violations{0u};
   for (const auto& [method, stores_referenced] : method_store_refs) {
@@ -327,7 +329,7 @@ unsigned AppModuleUsagePass::gather_violations(
       }
       TRACE(
           APP_MOD_USE,
-          0,
+          trace_level,
           "%s (from module \"%s\") uses app module \"%s\" without annotation\n",
           method_name.c_str(),
           m_type_store_map.at(method->get_class())->get_name().c_str(),
@@ -346,7 +348,7 @@ unsigned AppModuleUsagePass::gather_violations(
       continue;
     }
     TRACE(APP_MOD_USE,
-          0,
+          trace_level,
           "%s (from module \"%s\") uses app module \"%s\" without annotation\n",
           field_name.c_str(),
           m_type_store_map.at(field->get_class())->get_name().c_str(),
@@ -354,13 +356,19 @@ unsigned AppModuleUsagePass::gather_violations(
     violations[field_name].emplace(store->get_name());
     n_violations++;
   }
+
+  if (!traceEnabled(APP_MOD_USE, trace_level) && n_violations > 0) {
+    TRACE(APP_MOD_USE, 0,
+          "Found violations, re-run with TRACE=APP_MOD_USE:1 for details.");
+  }
+
   return n_violations;
 }
 
 template <typename T>
-std::unordered_set<std::string> AppModuleUsagePass::get_modules_used(
+std::unordered_set<std::string_view> AppModuleUsagePass::get_modules_used(
     T* entrypoint, DexType* annotation_type) {
-  std::unordered_set<std::string> modules = {};
+  std::unordered_set<std::string_view> modules = {};
   auto anno_set = entrypoint->get_anno_set();
   if (anno_set) {
     for (const auto& annotation : anno_set->get_annotations()) {
@@ -383,13 +391,13 @@ std::unordered_set<std::string> AppModuleUsagePass::get_modules_used(
   return modules;
 }
 
-template std::unordered_set<std::string>
+template std::unordered_set<std::string_view>
 AppModuleUsagePass::get_modules_used<DexMethod>(DexMethod*, DexType*);
 
-template std::unordered_set<std::string>
+template std::unordered_set<std::string_view>
 AppModuleUsagePass::get_modules_used<DexField>(DexField*, DexType*);
 
-template std::unordered_set<std::string>
+template std::unordered_set<std::string_view>
 AppModuleUsagePass::get_modules_used<DexClass>(DexClass*, DexType*);
 
 bool AppModuleUsagePass::access_excused_due_to_preexisting(
@@ -431,7 +439,7 @@ bool AppModuleUsagePass::access_granted_by_annotation(DexClass* cls,
 
   // Check outer class.
   std::string_view cls_name = cls->str();
-  auto dollar_sign_idx = cls_name.rfind("$");
+  auto dollar_sign_idx = cls_name.rfind('$');
   while (dollar_sign_idx != std::string_view::npos) {
     cls_name.remove_suffix(cls_name.size() - dollar_sign_idx);
     std::string new_class_name = std::string(cls_name) + ";";
@@ -440,7 +448,7 @@ bool AppModuleUsagePass::access_granted_by_annotation(DexClass* cls,
     if (outer_class) {
       return access_granted_by_annotation(outer_class, target);
     }
-    dollar_sign_idx = cls_name.rfind("$");
+    dollar_sign_idx = cls_name.rfind('$');
   }
   return false;
 }

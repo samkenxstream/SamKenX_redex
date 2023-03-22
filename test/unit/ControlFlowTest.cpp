@@ -881,7 +881,7 @@ TEST_F(ControlFlowTest, branchingness) {
   auto& cfg = code->cfg();
   uint16_t blocks_checked = 0;
   for (Block* b : cfg.blocks()) {
-    std::string str = b->get_first_insn()->insn->get_string()->str();
+    const auto str = b->get_first_insn()->insn->get_string()->str();
     if (str == "one") {
       EXPECT_EQ(opcode::BRANCH_IF, b->branchingness());
       ++blocks_checked;
@@ -904,7 +904,7 @@ TEST_F(ControlFlowTest, empty_first_block) {
       (const v0 0)
       (goto :exit)
 
-      (add-int/lit8 v0 v0 1)
+      (add-int/lit v0 v0 1)
 
       (:exit)
       (return-void)
@@ -992,13 +992,13 @@ TEST_F(ControlFlowTest, remove_ghost_exit_block) {
 
   code->build_cfg(/* editable */ true);
   auto& cfg = code->cfg();
-  EXPECT_EQ(cfg.blocks().size(), 3);
+  EXPECT_EQ(cfg.num_blocks(), 3);
   EXPECT_EQ(cfg.exit_block(), nullptr);
   cfg.calculate_exit_block();
-  EXPECT_EQ(cfg.blocks().size(), 4);
+  EXPECT_EQ(cfg.num_blocks(), 4);
   EXPECT_NE(cfg.exit_block(), nullptr);
   cfg.remove_block(cfg.exit_block());
-  EXPECT_EQ(cfg.blocks().size(), 3);
+  EXPECT_EQ(cfg.num_blocks(), 3);
   EXPECT_EQ(cfg.exit_block(), nullptr);
   code->clear_cfg();
 }
@@ -1015,13 +1015,13 @@ TEST_F(ControlFlowTest, remove_real_exit_block) {
 
   code->build_cfg(/* editable */ true);
   auto& cfg = code->cfg();
-  EXPECT_EQ(cfg.blocks().size(), 2);
+  EXPECT_EQ(cfg.num_blocks(), 2);
   EXPECT_EQ(cfg.exit_block(), nullptr);
   cfg.calculate_exit_block();
-  EXPECT_EQ(cfg.blocks().size(), 2);
+  EXPECT_EQ(cfg.num_blocks(), 2);
   EXPECT_NE(cfg.exit_block(), nullptr);
   cfg.remove_block(cfg.exit_block());
-  EXPECT_EQ(cfg.blocks().size(), 1);
+  EXPECT_EQ(cfg.num_blocks(), 1);
   EXPECT_EQ(cfg.exit_block(), nullptr);
   code->clear_cfg();
 }
@@ -1289,7 +1289,7 @@ TEST_F(ControlFlowTest, insertion) {
   )");
   code->build_cfg(/* editable */ true);
   auto& cfg = code->cfg();
-  IRInstruction add{OPCODE_ADD_INT_LIT8};
+  IRInstruction add{OPCODE_ADD_INT_LIT};
   add.set_literal(1);
   auto ii = cfg::InstructionIterable(cfg);
   for (auto it = ii.begin(); it != ii.end(); ++it) {
@@ -1306,18 +1306,18 @@ TEST_F(ControlFlowTest, insertion) {
   auto expected = assembler::ircode_from_string(R"(
     (
       (const v0 0)
-      (add-int/lit8 v0 v0 1)
+      (add-int/lit v0 v0 1)
       (if-eqz v0 :true)
 
       (const v1 1)
-      (add-int/lit8 v1 v1 1)
+      (add-int/lit v1 v1 1)
 
       (:exit)
       (return-void)
 
       (:true)
       (const v2 2)
-      (add-int/lit8 v2 v2 1)
+      (add-int/lit v2 v2 1)
       (goto :exit)
     )
   )");
@@ -1342,7 +1342,7 @@ TEST_F(ControlFlowTest, insertion_it) {
   )");
   code->build_cfg(/* editable */ true);
   auto& cfg = code->cfg();
-  IRInstruction add{OPCODE_ADD_INT_LIT8};
+  IRInstruction add{OPCODE_ADD_INT_LIT};
   add.set_literal(1);
   auto ii = cfg::InstructionIterable(cfg);
   for (auto it = ii.begin(); it != ii.end(); ++it) {
@@ -1363,21 +1363,21 @@ TEST_F(ControlFlowTest, insertion_it) {
   auto expected = assembler::ircode_from_string(R"(
     (
       (const v0 0)
-      (add-int/lit8 v0 v0 1)
-      (add-int/lit8 v0 v0 1)
+      (add-int/lit v0 v0 1)
+      (add-int/lit v0 v0 1)
       (if-eqz v0 :true)
 
       (const v1 1)
-      (add-int/lit8 v1 v1 1)
-      (add-int/lit8 v1 v1 1)
+      (add-int/lit v1 v1 1)
+      (add-int/lit v1 v1 1)
 
       (:exit)
       (return-void)
 
       (:true)
       (const v2 2)
-      (add-int/lit8 v2 v2 1)
-      (add-int/lit8 v2 v2 1)
+      (add-int/lit v2 v2 1)
+      (add-int/lit v2 v2 1)
       (goto :exit)
     )
   )");
@@ -1402,7 +1402,7 @@ TEST_F(ControlFlowTest, insertion_it_var) {
   )");
   code->build_cfg(/* editable */ true);
   auto& cfg = code->cfg();
-  IRInstruction add{OPCODE_ADD_INT_LIT8};
+  IRInstruction add{OPCODE_ADD_INT_LIT};
   add.set_literal(1);
   auto ii = cfg::InstructionIterable(cfg);
   for (auto it = ii.begin(); it != ii.end(); ++it) {
@@ -1427,24 +1427,24 @@ TEST_F(ControlFlowTest, insertion_it_var) {
   auto expected = assembler::ircode_from_string(R"(
     (
       (const v0 0)
-      (add-int/lit8 v0 v0 1)
+      (add-int/lit v0 v0 1)
       (.src_block "LFoo;.bar:()V" 0)
-      (add-int/lit8 v0 v0 1)
+      (add-int/lit v0 v0 1)
       (if-eqz v0 :true)
 
       (const v1 1)
-      (add-int/lit8 v1 v1 1)
+      (add-int/lit v1 v1 1)
       (.src_block "LFoo;.bar:()V" 0)
-      (add-int/lit8 v1 v1 1)
+      (add-int/lit v1 v1 1)
 
       (:exit)
       (return-void)
 
       (:true)
       (const v2 2)
-      (add-int/lit8 v2 v2 1)
+      (add-int/lit v2 v2 1)
       (.src_block "LFoo;.bar:()V" 0)
-      (add-int/lit8 v2 v2 1)
+      (add-int/lit v2 v2 1)
       (goto :exit)
     )
   )");
@@ -2236,7 +2236,7 @@ TEST_F(ControlFlowTest, split_block) {
 
   auto& cfg = code->cfg();
 
-  EXPECT_EQ(cfg.blocks().size(), 3);
+  EXPECT_EQ(cfg.num_blocks(), 3);
 
   // Simple split
   Block* s_block = cfg.blocks().back();
@@ -2244,7 +2244,7 @@ TEST_F(ControlFlowTest, split_block) {
 
   cfg.split_block(s_block->to_cfg_instruction_iterator(*s_block->begin()));
 
-  EXPECT_EQ(cfg.blocks().size(), 4);
+  EXPECT_EQ(cfg.num_blocks(), 4);
   EXPECT_EQ(s_block->succs().size(), 1);
   EXPECT_EQ(s_block->preds().size(), 1);
   EXPECT_EQ(s_block->preds()[0]->src()->begin()->insn->opcode(), OPCODE_CONST);
@@ -2253,7 +2253,7 @@ TEST_F(ControlFlowTest, split_block) {
   s_block = cfg.blocks().back();
   cfg.split_block(
       s_block->to_cfg_instruction_iterator(*std::prev(s_block->end())));
-  EXPECT_EQ(cfg.blocks().size(), 5);
+  EXPECT_EQ(cfg.num_blocks(), 5);
 
   EXPECT_EQ(s_block->succs().size(), 1);
   EXPECT_EQ(s_block->begin()->insn->opcode(), OPCODE_ADD_INT);
@@ -2452,7 +2452,7 @@ TEST_F(ControlFlowTest, entry_not_first_block_order_first) {
       (goto :loop)
 
       (:true)
-      (add-int/lit8 v0 v0 1)
+      (add-int/lit v0 v0 1)
 
       (:loop)
       (if-eqz v0 :true)
@@ -2477,7 +2477,7 @@ TEST_F(ControlFlowTest, entry_not_first_block_order_first_linearization) {
       (goto :loop)
 
       (:true)
-      (add-int/lit8 v0 v0 1)
+      (add-int/lit v0 v0 1)
 
       (:loop)
       (if-eqz v0 :true)
@@ -2496,7 +2496,7 @@ TEST_F(ControlFlowTest, entry_not_first_block_order_first_linearization) {
 OPCODE: IF_EQZ v0
 OPCODE: RETURN_VOID
 TARGET: SIMPLE
-OPCODE: ADD_INT_LIT8 v0, v0, 1
+OPCODE: ADD_INT_LIT v0, v0, 1
 OPCODE: GOTO
 )");
 }
@@ -2509,7 +2509,7 @@ TEST_F(ControlFlowTest, empty_block_move_pos) {
       (goto :loop)
 
       (:true)
-      (add-int/lit8 v0 v0 1)
+      (add-int/lit v0 v0 1)
 
       (:loop)
       (if-eqz v0 :true)
@@ -2529,7 +2529,7 @@ POSITION: LFoo;.m:()V(Foo.java:1)
 OPCODE: IF_EQZ v0
 OPCODE: RETURN_VOID
 TARGET: SIMPLE
-OPCODE: ADD_INT_LIT8 v0, v0, 1
+OPCODE: ADD_INT_LIT v0, v0, 1
 OPCODE: GOTO
 )");
 }
@@ -2565,7 +2565,7 @@ TEST_F(ControlFlowTest, empty_block_do_not_move_into_block_with_pos_complex) {
       (goto :loop)
 
       (:true)
-      (add-int/lit8 v0 v0 1)
+      (add-int/lit v0 v0 1)
 
       (:loop)
       (.pos "LFoo;.m:()V" "Foo.java" 2)
@@ -2590,7 +2590,7 @@ OPCODE: IF_EQZ v0
 OPCODE: RETURN_VOID
 TARGET: SIMPLE
 POSITION: LFoo;.m:()V(Foo.java:1)
-OPCODE: ADD_INT_LIT8 v0, v0, 1
+OPCODE: ADD_INT_LIT v0, v0, 1
 OPCODE: GOTO
 )");
 }
@@ -2604,7 +2604,7 @@ TEST_F(ControlFlowTest, empty_block_not_move_source_blocks_complex) {
       (goto :loop)
 
       (:true)
-      (add-int/lit8 v0 v0 1)
+      (add-int/lit v0 v0 1)
 
       (:loop)
       (.src_block "LFoo;.m:()V" 3)
@@ -2625,7 +2625,7 @@ SOURCE-BLOCKS: LFoo;.m:()V@3()
 OPCODE: IF_EQZ v0
 OPCODE: RETURN_VOID
 TARGET: SIMPLE
-OPCODE: ADD_INT_LIT8 v0, v0, 1
+OPCODE: ADD_INT_LIT v0, v0, 1
 OPCODE: GOTO
 )");
 }
@@ -2668,4 +2668,115 @@ TEST_F(ControlFlowTest, non_editable_cfg_case_keys) {
   std::sort(case_keys.begin(), case_keys.end());
   EXPECT_EQ(case_keys.at(0), 0);
   EXPECT_EQ(case_keys.at(1), 1);
+}
+
+TEST_F(ControlFlowTest, insert_block_if) {
+  auto code = assembler::ircode_from_string(R"(
+    (
+      (const v0 0)
+      (if-eqz v0 :true)
+
+      (const v1 1)
+      (return v1)
+
+      (:true)
+      (const v1 2)
+      (add-int v1 v1 v1)
+      (return v1)
+    )
+  )");
+  code->build_cfg(/* editable */ true);
+  auto& cfg = code->cfg();
+  EXPECT_EQ(cfg.num_blocks(), 3);
+
+  auto nb0 = cfg.create_block();
+  auto nb1 = cfg.create_block();
+
+  // Now the cfg should be:
+  // entry_block --(GOTO)--> goto_block
+  //      |
+  //      ----(BRANCH) --> branch_block
+  auto entry_block = cfg.entry_block();
+  EXPECT_TRUE(entry_block->succs().size() == 2);
+  auto goto_block = entry_block->goes_to();
+  EXPECT_TRUE(goto_block);
+  auto branch_edge = cfg.get_succ_edge_of_type(entry_block, cfg::EDGE_BRANCH);
+  EXPECT_TRUE(branch_edge);
+  auto branch_block = branch_edge->target();
+
+  cfg.insert_block(entry_block, goto_block, nb0);
+  cfg.insert_block(entry_block, branch_block, nb1);
+
+  // Now the cfg should be:
+  // entry_block --(GOTO)--> nb0 --(GOTO)-->goto_block
+  //      |
+  //      ----(BRANCH) --> nb1 -- (GOTO) --> branch_block
+  EXPECT_EQ(cfg.num_blocks(), 5);
+  EXPECT_TRUE(entry_block->succs().size() == 2);
+  EXPECT_TRUE(entry_block->goes_to() != nullptr &&
+              entry_block->goes_to() == nb0);
+  EXPECT_TRUE(nb0->goes_to() != nullptr && nb0->goes_to() == goto_block);
+
+  auto new_branch_edge =
+      cfg.get_succ_edge_of_type(entry_block, cfg::EDGE_BRANCH);
+  EXPECT_TRUE(new_branch_edge);
+  EXPECT_TRUE(new_branch_edge->target() == nb1);
+  EXPECT_TRUE(nb1->goes_to() != nullptr && nb1->goes_to() == branch_block);
+}
+
+TEST_F(ControlFlowTest, insert_block_switch) {
+  auto code = assembler::ircode_from_string(R"(
+    (
+     (load-param v0)
+     (switch v0 (:b :c :d))
+
+     (const v1 100)
+     (return v1)
+
+     (:b 1)
+     (:c 2)
+     (:d 3)
+     (const v1 300)
+     (return v1)
+    )
+  )");
+
+  code->build_cfg(/* editable */ true);
+  auto& cfg = code->cfg();
+  EXPECT_EQ(cfg.num_blocks(), 3);
+
+  // Now the cfg should be:
+  // switch_block --(GOTO)--> default_block
+  //    |   |  |
+  //    |   |   ----(BRANCH case_key 1) --> branch_block
+  //    |   --------(BRANCH case_key 2) -------^  ^
+  //    ------------(BRANCH case_key 3)-----------|
+  auto switch_block = cfg.entry_block();
+  auto goto_edge = cfg.get_succ_edge_of_type(switch_block, cfg::EDGE_GOTO);
+  EXPECT_TRUE(goto_edge);
+  auto branch_edges =
+      cfg.get_succ_edges_of_type(switch_block, cfg::EDGE_BRANCH);
+  EXPECT_EQ(branch_edges.size(), 3);
+  auto branch_block = branch_edges[0]->target();
+  EXPECT_TRUE(branch_block);
+  EXPECT_TRUE(branch_edges[1]->target() == branch_block &&
+              branch_edges[2]->target() == branch_block);
+
+  auto nb0 = cfg.create_block();
+  cfg.insert_block(switch_block, branch_block, nb0);
+
+  // After insertion the cfg should be:
+  // switch_block --(GOTO)--> default_block
+  //    |   |  |
+  //    |   |   ----(BRANCH case_key 1) -->       nb0 --(GOTO)-->branch_block
+  //    |   --------(BRANCH case_key 2) -------^  ^
+  //    ------------(BRANCH case_key 3)-----------|
+  EXPECT_EQ(cfg.num_blocks(), 4);
+  auto new_branch_edges =
+      cfg.get_succ_edges_of_type(switch_block, cfg::EDGE_BRANCH);
+  EXPECT_EQ(new_branch_edges.size(), 3);
+  EXPECT_TRUE(branch_edges[0]->target() == nb0);
+  EXPECT_TRUE(branch_edges[1]->target() == nb0);
+  EXPECT_TRUE(branch_edges[2]->target() == nb0);
+  EXPECT_TRUE(nb0->goes_to() != nullptr && nb0->goes_to() == branch_block);
 }

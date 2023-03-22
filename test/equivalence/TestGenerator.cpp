@@ -22,6 +22,7 @@
 #include "DexPosition.h"
 #include "IRCode.h"
 #include "InstructionLowering.h"
+#include "RedexOptions.h"
 #include "RedexTestUtils.h"
 #include "SanitizersConfig.h"
 #include "TestGenerator.h"
@@ -61,7 +62,7 @@ int main(int argc, char* argv[]) {
   auto dex = argv[1];
 
   g_redex = new RedexContext();
-  auto classes = load_classes_from_dex(dex);
+  auto classes = load_classes_from_dex(DexLocation::make_location("", dex));
   auto runner_cls =
       std::find_if(classes.begin(), classes.end(), [](const DexClass* cls) {
         return cls->get_name() ==
@@ -91,24 +92,25 @@ int main(int argc, char* argv[]) {
   std::unique_ptr<PositionMapper> pos_mapper(PositionMapper::make(""));
 
   DexStore store("classes");
-  store.set_dex_magic(load_dex_magic_from_dex(dex));
+  store.set_dex_magic(
+      load_dex_magic_from_dex(DexLocation::make_location("dex", dex)));
   store.add_classes(classes);
   DexStoresVector stores;
   stores.emplace_back(std::move(store));
   instruction_lowering::run(stores);
 
-  RedexOptions redex_options;
   auto gtypes = std::make_shared<GatheredTypes>(&classes);
 
-  write_classes_to_dex(redex_options,
-                       dex,
+  write_classes_to_dex(dex,
                        &classes,
                        std::move(gtypes),
                        nullptr /* LocatorIndex* */,
                        0,
+                       nullptr /* store_name */,
                        0,
                        conf,
                        pos_mapper.get(),
+                       DebugInfoKind::NoCustomSymbolication,
                        nullptr,
                        nullptr,
                        nullptr /* IODIMetadata* */,

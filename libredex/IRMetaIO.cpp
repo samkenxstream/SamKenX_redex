@@ -27,11 +27,11 @@ PACKED(struct ir_meta_header_t {
   uint32_t rstate_size; // size of IRMetaIO::bit_rstate_t.
 });
 
-void serialize_str(const std::string& str, std::ofstream& ostrm) {
+void serialize_str(const std::string_view str, std::ofstream& ostrm) {
   char data[5];
   write_uleb128((uint8_t*)data, str.size());
   ostrm.write(data, uleb128_encoding_size(str.size()));
-  ostrm.write(str.c_str(), str.size());
+  ostrm.write(str.data(), str.size());
   ostrm.put('\0');
 }
 
@@ -183,7 +183,7 @@ void deserialize_class_data(std::ifstream& istrm, uint32_t data_size) {
     switch (btype) {
     case BlockType::ClassBlock: {
       // Create a std::string for null termination
-      DexType* type = DexType::get_type(std::string(ptr, strsize));
+      DexType* type = DexType::get_type(std::string_view(ptr, strsize));
       cls = type_class(type);
       always_assert(cls != nullptr);
       ptr += strsize + 1;

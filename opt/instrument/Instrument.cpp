@@ -29,6 +29,7 @@
 #include <cmath>
 #include <fstream>
 #include <iostream>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -50,6 +51,7 @@ constexpr bool instr_debug = false;
 
 constexpr const char* SIMPLE_METHOD_TRACING = "simple_method_tracing";
 constexpr const char* BASIC_BLOCK_TRACING = "basic_block_tracing";
+constexpr const char* BASIC_BLOCK_HIT_COUNT = "basic_block_hit_count";
 constexpr const char* METHOD_REPLACEMENT = "methods_replacement";
 
 class InstrumentInterDexPlugin : public interdex::InterDexPassPlugin {
@@ -57,20 +59,13 @@ class InstrumentInterDexPlugin : public interdex::InterDexPassPlugin {
   explicit InstrumentInterDexPlugin(size_t max_analysis_methods)
       : m_max_analysis_methods(max_analysis_methods) {}
 
-  size_t reserve_frefs() override {
-    // We may introduce a new field
-    return 1;
-  }
-
-  size_t reserve_trefs() override {
-    // We introduce a type reference to the analysis class in each dex
-    return 1;
-  }
-
-  size_t reserve_mrefs() override {
-    // In each dex, we will introduce more method refs from analysis methods.
-    // This makes sure that the inter-dex pass keeps space for new method refs.
-    return m_max_analysis_methods;
+  interdex::ReserveRefsInfo reserve_refs() override {
+    // We may introduce a new field. We introduce a type reference to the
+    // analysis class in each dex. We will introduce more method refs from
+    // analysis methods.
+    return interdex::ReserveRefsInfo(/* frefs */ 1,
+                                     /* trefs */ 1,
+                                     /* mrefs */ m_max_analysis_methods);
   }
 
  private:
@@ -193,7 +188,7 @@ void do_simple_method_tracing(DexClass* analysis_cls,
   std::vector<DexMethod*> to_instrument;
 
   auto worker = [&](DexMethod* method, size_t& total_size) -> int {
-    const auto& name = method->get_deobfuscated_name_or_empty();
+    std::string name = method->get_deobfuscated_name_or_empty_copy();
     always_assert_log(
         !name.empty(),
         "Deobfuscated method name can't be empty: obfuscated "
@@ -217,7 +212,7 @@ void do_simple_method_tracing(DexClass* analysis_cls,
     total_size += sum_opcode_sizes;
 
     // Excluding analysis methods myselves.
-    if (analysis_method_names.count(method->get_name()->str()) ||
+    if (analysis_method_names.count(method->get_name()->str_copy()) ||
         method == analysis_cls->get_clinit()) {
       ++excluded;
       TRACE(INSTRUMENT, 2, "Excluding analysis method: %s", SHOW(method));
@@ -284,7 +279,7 @@ void do_simple_method_tracing(DexClass* analysis_cls,
   //  1) For all methods, collect (method id, method) pairs and write meta data.
   //  2) Do actual instrumentation.
   for (const auto& cls : scope) {
-    const auto& cls_name = cls->get_deobfuscated_name_or_empty();
+    std::string cls_name = cls->get_deobfuscated_name_or_empty_copy();
     always_assert_log(
         !method_names.count(cls_name),
         "Deobfuscated class names must be unique, but found duplicate: %s",
@@ -442,7 +437,7 @@ constexpr const char* InstrumentPass::STATS_FIELD_NAME;
 
 // Find a sequence of opcode that creates a static array. Patch the array size.
 void InstrumentPass::patch_array_size(DexClass* analysis_cls,
-                                      const std::string& array_name,
+                                      const std::string_view array_name,
                                       const int array_size) {
   DexMethod* clinit = analysis_cls->get_clinit();
   always_assert(clinit != nullptr);
@@ -493,7 +488,7 @@ void InstrumentPass::patch_array_size(DexClass* analysis_cls,
 }
 
 void InstrumentPass::patch_static_field(DexClass* analysis_cls,
-                                        const std::string& field_name,
+                                        const std::string_view field_name,
                                         const int new_number) {
   DexMethod* clinit = analysis_cls->get_clinit();
   always_assert(clinit != nullptr);
@@ -560,6 +555,9 @@ void InstrumentPass::bind_config() {
        m_options.instrument_blocks_without_source_block);
   bind("instrument_only_root_store", false,
        m_options.instrument_only_root_store);
+  bind("inline_onBlockHit", false, m_options.inline_onBlockHit);
+  bind("inline_onNonLoopBlockHit", false, m_options.inline_onNonLoopBlockHit);
+  bind("apply_CSE_CopyProp", false, m_options.apply_CSE_CopyProp);
 
   size_t max_analysis_methods;
   if (m_options.instrumentation_strategy == SIMPLE_METHOD_TRACING) {
@@ -629,6 +627,36 @@ void maybe_unset_dynamic_analysis(DexStoresVector& stores,
   }
 }
 
+void set_no_opt_flag_on_analysis_methods(
+    bool value,
+    const std::string& analysis_class_name,
+    const std::vector<std::string>& analysis_method_names) {
+
+  // Set the 'no_optimizations' flag for analysis methods (onMethodBeginGated,
+  // onMethodExit). Primarily so we do not outline from them.
+
+  auto analysis_type = DexType::get_type(analysis_class_name);
+  if (analysis_type == nullptr) {
+    return;
+  }
+
+  auto analysis_cls = type_class(analysis_type);
+  if (analysis_cls == nullptr) {
+    return;
+  }
+
+  for (auto* m : analysis_cls->get_all_methods()) {
+    if (std::find(analysis_method_names.begin(), analysis_method_names.end(),
+                  m->get_name()->str()) != analysis_method_names.end()) {
+      if (value) {
+        m->rstate.set_no_optimizations();
+      } else {
+        m->rstate.reset_no_optimizations();
+      }
+    }
+  }
+}
+
 } // namespace
 
 void InstrumentPass::eval_pass(DexStoresVector& stores,
@@ -641,6 +669,9 @@ void InstrumentPass::eval_pass(DexStoresVector& stores,
   }
 
   // Note: Could do the inverse and protect necessary members here.
+
+  set_no_opt_flag_on_analysis_methods(true, m_options.analysis_class_name,
+                                      m_options.analysis_method_names);
 }
 
 // Check for inclusion in allow/block lists of methods/classes. It supports:
@@ -654,7 +685,7 @@ bool InstrumentPass::is_included(const DexMethod* method,
   }
 
   // Try to check for method by its full name.
-  const auto& full_method_name = method->get_deobfuscated_name_or_empty();
+  std::string full_method_name = method->get_deobfuscated_name_or_empty_copy();
   if (set.count(full_method_name)) {
     return true;
   }
@@ -692,7 +723,7 @@ InstrumentPass::generate_sharded_analysis_methods(
     exit(1);
   }
 
-  const std::string& template_method_name = template_method->get_name()->str();
+  const auto template_method_name = template_method->get_name()->str();
 
   std::unordered_map<int /*shard_num*/, DexMethod*> new_analysis_methods;
   std::unordered_set<std::string> method_names;
@@ -701,14 +732,14 @@ InstrumentPass::generate_sharded_analysis_methods(
   for (size_t i = 1; i <= num_shards; ++i) {
     const auto new_name = template_method_name + std::to_string(i);
     std::string deobfuscated_name =
-        template_method->get_deobfuscated_name_or_empty();
+        template_method->get_deobfuscated_name_or_empty_copy();
     boost::replace_first(deobfuscated_name, template_method_name, new_name);
 
     DexMethod* new_method =
         DexMethod::make_method_from(template_method,
                                     template_method->get_class(),
                                     DexString::make_string(new_name));
-    new_method->set_deobfuscated_name(deobfuscated_name);
+    new_method->set_deobfuscated_name(str_copy(deobfuscated_name));
     cls->add_method(new_method);
 
     // Patch the array name in newly created method.
@@ -945,7 +976,7 @@ void InstrumentPass::run_pass(DexStoresVector& stores,
 
   // Check whether the analysis class is in the primary dex. We use a heuristic
   // that looks the last 12 characters of the location of the given dex.
-  auto dex_loc = analysis_cls->get_location();
+  auto dex_loc = analysis_cls->get_location()->get_file_name();
   if (dex_loc.size() < 12 /* strlen("/classes.dex") == 12 */ ||
       dex_loc.substr(dex_loc.size() - 12) != "/classes.dex") {
     std::cerr << "[InstrumentPass] Analysis class must be in the primary dex. "
@@ -960,11 +991,12 @@ void InstrumentPass::run_pass(DexStoresVector& stores,
         3,
         "Loaded analysis class: %s (%s)",
         SHOW(m_options.analysis_class_name),
-        SHOW(analysis_cls->get_location()));
+        SHOW(analysis_cls->get_location()->get_file_name()));
 
   if (m_options.instrumentation_strategy == SIMPLE_METHOD_TRACING) {
     do_simple_method_tracing(analysis_cls, stores, cfg, pm, m_options);
-  } else if (m_options.instrumentation_strategy == BASIC_BLOCK_TRACING) {
+  } else if (m_options.instrumentation_strategy == BASIC_BLOCK_TRACING ||
+             m_options.instrumentation_strategy == BASIC_BLOCK_HIT_COUNT) {
     BlockInstrumentHelper::do_basic_block_tracing(analysis_cls, stores, cfg, pm,
                                                   m_options);
   } else {
@@ -972,35 +1004,79 @@ void InstrumentPass::run_pass(DexStoresVector& stores,
     exit(1);
   }
 
-  Timer cleanup{"Cleanup"};
-  // We're done and have inserted our instrumentation. Allow further cleanup.
-  g_redex->instrument_mode = false;
-
   // Be nice and immediately destruct some painful block overhead.
 
   auto scope = build_class_scope(stores);
 
+  // We're done and have inserted our instrumentation. Allow further cleanup.
+  g_redex->instrument_mode = false;
+
+  // Allow optimizations in analysis methods while the Shrinker runs
+  set_no_opt_flag_on_analysis_methods(false, m_options.analysis_class_name,
+                                      m_options.analysis_method_names);
+
   // Simple config.
   shrinker::ShrinkerConfig shrinker_config;
   shrinker_config.run_const_prop = true;
-  shrinker_config.run_copy_prop = true;
   shrinker_config.run_local_dce = true;
   shrinker_config.compute_pure_methods = false;
+  if (m_options.apply_CSE_CopyProp) {
+    shrinker_config.run_cse = true;
+    shrinker_config.run_copy_prop = true;
+  }
+
+  std::unordered_set<const DexField*> finalish_fields;
+  if (m_options.apply_CSE_CopyProp) {
+    auto* field =
+        analysis_cls->find_field_from_simple_deobfuscated_name("sHitStats");
+    finalish_fields.insert(field);
+    field->rstate.unset_root();
+    always_assert(field->rstate.can_delete() && field->rstate.can_rename());
+
+    field =
+        analysis_cls->find_field_from_simple_deobfuscated_name("sIsEnabled");
+    finalish_fields.insert(field);
+    field->rstate.unset_root();
+    always_assert(field->rstate.can_delete() && field->rstate.can_rename());
+
+    field = analysis_cls->find_field_from_simple_deobfuscated_name(
+        "sNumStaticallyHitsInstrumented");
+    finalish_fields.insert(field);
+    field->rstate.unset_root();
+    always_assert(field->rstate.can_delete() && field->rstate.can_rename());
+
+    field = analysis_cls->find_field_from_simple_deobfuscated_name(
+        "sNumStaticallyInstrumented");
+    finalish_fields.insert(field);
+    field->rstate.unset_root();
+    always_assert(field->rstate.can_delete() && field->rstate.can_rename());
+  }
 
   init_classes::InitClassesWithSideEffects init_classes_with_side_effects(
       scope, cfg.create_init_class_insns());
 
   int min_sdk = pm.get_redex_options().min_sdk;
   shrinker::Shrinker shrinker(stores, scope, init_classes_with_side_effects,
-                              shrinker_config, min_sdk);
+                              shrinker_config, min_sdk, {}, {},
+                              finalish_fields);
 
-  walk::parallel::methods(scope, [&](auto* m) {
-    if (m->get_code() == nullptr) {
-      return;
-    }
+  {
+    Timer cleanup{"Parallel Cleanup"};
 
-    shrinker.shrink_method(m);
-  });
+    walk::parallel::methods(scope, [&](auto* m) {
+      if (m->get_code() == nullptr) {
+        return;
+      }
+
+      shrinker.shrink_method(m);
+    });
+  }
+
+  // Probably shouldn't need to do this, as the outliner shouldn't run after
+  // InstrumentPass, but let's be defensive, in case pass order changes in
+  // future.
+  set_no_opt_flag_on_analysis_methods(true, m_options.analysis_class_name,
+                                      m_options.analysis_method_names);
 }
 
 static InstrumentPass s_pass;

@@ -52,6 +52,8 @@ libredex_la_SOURCES = \
 	libredex/CallGraph.cpp \
 	libredex/ClassHierarchy.cpp \
 	libredex/ClassUtil.cpp \
+	libredex/ClassChecker.cpp \
+	libredex/ConcurrentContainers.cpp \
 	libredex/ConfigFiles.cpp \
 	libredex/Configurable.cpp \
 	libredex/ControlFlow.cpp \
@@ -152,6 +154,7 @@ libredex_la_SOURCES = \
 	libredex/Show.cpp \
 	libredex/SourceBlockConsistencyCheck.cpp \
 	libredex/SourceBlocks.cpp \
+	libredex/StringTreeSet.cpp \
 	libredex/Timer.cpp \
 	libredex/Trace.cpp \
 	libredex/Transform.cpp \
@@ -163,11 +166,11 @@ libredex_la_SOURCES = \
 	libredex/VirtualScope.cpp \
 	libredex/Warning.cpp \
 	libredex/WorkQueue.cpp \
-	libresource/FileMap.cpp \
+	libresource/LocaleValue.cpp \
+	libresource/LocaleData.cpp \
 	libresource/ResourceTypes.cpp \
 	libresource/Serialize.cpp \
 	libresource/SharedBuffer.cpp \
-	libresource/Static.cpp \
 	libresource/String16.cpp \
 	libresource/String8.cpp \
 	libresource/TypeWrappers.cpp \
@@ -186,6 +189,7 @@ libredex_la_SOURCES = \
 	service/class-merging/ModelMethodMerger.cpp \
 	service/class-merging/Model.cpp \
 	service/class-merging/TypeTagUtils.cpp \
+	service/class-splitting/ClassSplitting.cpp \
 	service/cross-dex-ref-minimizer/CrossDexRefMinimizer.cpp \
 	service/constant-propagation/ConstantEnvironment.cpp \
 	service/constant-propagation/ConstantPropagationAnalysis.cpp \
@@ -241,6 +245,7 @@ libredex_la_SOURCES = \
 	service/regalloc/VirtualRegistersFile.cpp \
 	service/regalloc-fast/LinearScan.cpp \
 	service/regalloc-fast/LiveInterval.cpp \
+	service/resources/StaticIds.cpp \
 	service/shrinker/Shrinker.cpp \
 	service/switch-dispatch/SwitchDispatch.cpp \
 	service/switch-partitioning/SwitchEquivFinder.cpp \
@@ -296,20 +301,21 @@ libopt_la_SOURCES = \
 	opt/builder_pattern/BuilderTransform.cpp \
 	opt/builder_pattern/RemoveBuilderPattern.cpp \
 	opt/branch-prefix-hoisting/BranchPrefixHoisting.cpp \
-	opt/bridge/Bridge.cpp \
 	opt/check_breadcrumbs/CheckBreadcrumbs.cpp \
 	opt/check-recursion/CheckRecursion.cpp \
 	opt/class-merging/AnonymousClassMergingPass.cpp \
 	opt/class-merging/ClassMergingPass.cpp \
 	opt/class-merging/IntraDexClassMergingPass.cpp \
 	opt/class-merging/ModelSpecGenerator.cpp \
-	opt/class-splitting/ClassSplitting.cpp \
+	opt/class-splitting/ClassSplittingPass.cpp \
 	opt/constant-propagation/ConstantPropagationPass.cpp \
 	opt/constant-propagation/ConstantPropagationRuntimeAssert.cpp \
 	opt/constant-propagation/IPConstantPropagation.cpp \
 	opt/copy-propagation/CopyPropagationPass.cpp \
 	opt/cse/CommonSubexpressionEliminationPass.cpp \
 	opt/dedup_blocks/DedupBlocksPass.cpp \
+	opt/dedup_resources/DedupResources.cpp \
+	opt/dedup_resources/murmur_hash.cpp \
 	opt/dedup-strings/DedupStrings.cpp \
 	opt/delinit/DelInit.cpp \
 	opt/delsuper/DelSuper.cpp \
@@ -320,10 +326,11 @@ libopt_la_SOURCES = \
 	opt/insert-source-blocks/InsertSourceBlocks.cpp \
 	opt/instrument/BlockInstrument.cpp \
 	opt/instrument/Instrument.cpp \
-	opt/interdex/CrossDexRelocator.cpp \
 	opt/interdex/DexStructure.cpp \
 	opt/interdex/InterDex.cpp \
 	opt/interdex/InterDexPass.cpp \
+	opt/interdex/InterDexReshufflePass.cpp \
+	opt/interdex/SortRemainingClassesPass.cpp \
 	opt/kotlin-lambda/RewriteKotlinSingletonInstance.cpp \
 	opt/kotlin-lambda/KotlinObjectInliner.cpp \
 	opt/layout-reachability/LayoutReachabilityPass.cpp \
@@ -332,6 +339,7 @@ libopt_la_SOURCES = \
 	opt/obfuscate/Obfuscate.cpp \
 	opt/obfuscate/ObfuscateUtils.cpp \
 	opt/obfuscate/VirtualRenamer.cpp \
+	opt/obfuscate_resources/ObfuscateResourcesPass.cpp \
 	opt/object-sensitive-dce/ObjectSensitiveDcePass.cpp \
 	opt/object-sensitive-dce/SideEffectSummary.cpp \
 	opt/object-sensitive-dce/UsedVarsAnalysis.cpp \
@@ -343,12 +351,14 @@ libopt_la_SOURCES = \
 	opt/optimize_enums/EnumUpcastAnalysis.cpp \
 	opt/optimize_enums/OptimizeEnumsAnalysis.cpp \
 	opt/optimize_enums/OptimizeEnums.cpp \
+	opt/optimize_enums/OptimizeEnumsUnmap.cpp \
 	opt/original_name/OriginalNamePass.cpp \
 	opt/partial-application/PartialApplication.cpp \
 	opt/peephole/Peephole.cpp \
 	opt/peephole/RedundantCheckCastRemover.cpp \
 	opt/print-kotlin-stats/PrintKotlinStats.cpp \
 	opt/print-members/PrintMembers.cpp \
+  opt/reachable-natives/ReachableNatives.cpp \
 	opt/rebindrefs/ReBindRefs.cpp \
 	opt/regalloc/RegAlloc.cpp \
 	opt/regalloc-fast/FastRegAlloc.cpp \
@@ -366,7 +376,6 @@ libopt_la_SOURCES = \
 	opt/remove-nullcheck-string-arg/RemoveNullcheckStringArg.cpp \
 	opt/remove-unused-fields/RemoveUnusedFields.cpp \
 	opt/remove_empty_classes/RemoveEmptyClasses.cpp \
-	opt/remove_gotos/RemoveGotos.cpp \
 	opt/remove-unused-args/RemoveUnusedArgs.cpp \
 	opt/renameclasses/RenameClassesV2.cpp \
 	opt/reorder-interfaces-decl/ReorderInterfacesDecl.cpp \
@@ -375,12 +384,14 @@ libopt_la_SOURCES = \
 	opt/reduce-gotos/ReduceGotos.cpp \
 	opt/resolve-refs/ResolveRefsPass.cpp \
 	opt/resolve-refs/ExternalRefsManglingPass.cpp \
+	opt/resolve-refs/SpecializeRtype.cpp \
 	opt/result-propagation/ResultPropagation.cpp \
 	opt/resolve-proguard-values/ResolveProguardAssumeValues.cpp \
 	opt/shorten-srcstrings/Shorten.cpp \
 	opt/shrinker/ShrinkerPass.cpp \
 	opt/make-public/MakePublicPass.cpp \
 	opt/methodinline/IntraDexInlinePass.cpp \
+	opt/methodinline/LocalMethodInlinePass.cpp \
 	opt/methodinline/MethodInlinePass.cpp \
 	opt/methodinline/PerfMethodInlinePass.cpp \
 	opt/methodinline/BridgeSynthInlinePass.cpp \
@@ -390,16 +401,17 @@ libopt_la_SOURCES = \
 	opt/singleimpl/SingleImplAnalyze.cpp \
 	opt/singleimpl/SingleImplOptimize.cpp \
 	opt/singleimpl/SingleImplStats.cpp \
-	opt/simplify_cfg/SimplifyCFG.cpp \
 	opt/split_huge_switches/SplitHugeSwitchPass.cpp \
+	opt/split_resource_tables/SplitResourceTables.cpp \
+	opt/object-escape-analysis/ExpandableMethodParams.cpp \
 	opt/object-escape-analysis/ObjectEscapeAnalysis.cpp \
 	opt/staticrelo/StaticReloV2.cpp \
 	opt/string_concatenator/StringConcatenator.cpp \
 	opt/stringbuilder-outliner/StringBuilderOutliner.cpp \
 	opt/strip-debug-info/StripDebugInfo.cpp \
-	opt/synth/Synth.cpp \
 	opt/test_cfg/TestCFG.cpp \
 	opt/track_resources/TrackResources.cpp \
+	opt/optimize_resources/OptimizeResources.cpp \
 	opt/throw-propagation/ThrowPropagationPass.cpp \
 	opt/type-analysis/CallGraphFileGenerationPass.cpp \
 	opt/type-analysis/GlobalTypeAnalysisPass.cpp \

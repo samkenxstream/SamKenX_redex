@@ -23,16 +23,24 @@
 #include <stdexcept>
 #include <vector>
 
-DexLoader::DexLoader(const char* location)
+DexLoader::DexLoader(const DexLocation* location)
     : m_idx(nullptr),
       m_file(new boost::iostreams::mapped_file()),
-      m_dex_location(location) {}
+      m_location(location) {}
 
 static void validate_dex_header(const dex_header* dh,
                                 size_t dexsize,
                                 int support_dex_version) {
+  always_assert_log(sizeof(dex_header) <= dexsize,
+                    "Header size (%lu) is larger than file size (%zu)\n",
+                    dexsize,
+                    sizeof(dex_header));
   bool supported = false;
   switch (support_dex_version) {
+  case 39:
+    supported = supported ||
+                !memcmp(dh->magic, DEX_HEADER_DEXMAGIC_V39, sizeof(dh->magic));
+    FALLTHROUGH_INTENDED; /* intentional fallthrough to also check for v38 */
   case 38:
     supported = supported ||
                 !memcmp(dh->magic, DEX_HEADER_DEXMAGIC_V38, sizeof(dh->magic));
@@ -56,10 +64,76 @@ static void validate_dex_header(const dex_header* dh,
       "Reported size in header (%zu) does not match file size (%u)\n",
       dexsize,
       dh->file_size);
-  auto off = (uint64_t)dh->class_defs_off;
-  auto limit = off + dh->class_defs_size * sizeof(dex_class_def);
-  always_assert_log(off < dexsize, "class_defs_off out of range");
-  always_assert_log(limit <= dexsize, "invalid class_defs_size");
+
+  auto map_list_off = (uint64_t)dh->map_off;
+  always_assert_log(map_list_off < dexsize, "map_off out of range");
+  const uint8_t* dexbase = (const uint8_t*)dh;
+  const dex_map_list* map_list = (dex_map_list*)(dexbase + dh->map_off);
+  auto map_list_limit = map_list_off + map_list->size * sizeof(dex_map_item);
+  always_assert_log(map_list_limit < dexsize, "inavlid map_list size");
+
+  for (uint32_t i = 0; i < map_list->size; i++) {
+    auto& item = map_list->items[i];
+    switch (item.type) {
+    case TYPE_CALL_SITE_ID_ITEM: {
+      auto callsite_ids_off = (uint64_t)item.offset;
+      always_assert_log(callsite_ids_off < dexsize,
+                        "callsite_ids out of range");
+      dex_callsite_id* callsite_ids =
+          (dex_callsite_id*)((uint8_t*)dh + item.offset);
+      auto callsite_ids_limit =
+          callsite_ids_off + item.size * sizeof(dex_callsite_id);
+      always_assert_log(callsite_ids_limit < dexsize,
+                        "inavlid callsite_ids size");
+    } break;
+    case TYPE_METHOD_HANDLE_ITEM: {
+      auto methodhandle_ids_off = (uint64_t)item.offset;
+      always_assert_log(methodhandle_ids_off < dexsize,
+                        "methodhandle_ids out of range");
+      dex_methodhandle_id* methodhandle_ids =
+          (dex_methodhandle_id*)((uint8_t*)dh + item.offset);
+      auto methodhandle_ids_limit =
+          methodhandle_ids_off + item.size * sizeof(dex_callsite_id);
+      always_assert_log(methodhandle_ids_limit < dexsize,
+                        "inavlid methodhandle_ids size");
+    } break;
+    }
+  }
+
+  auto str_ids_off = (uint64_t)dh->string_ids_off;
+  auto str_ids_limit =
+      str_ids_off + dh->string_ids_size * sizeof(dex_string_id);
+  always_assert_log(str_ids_off < dexsize, "string_ids_off out of range");
+  always_assert_log(str_ids_limit <= dexsize, "invalid string_ids_size");
+
+  auto type_ids_off = (uint64_t)dh->type_ids_off;
+  auto type_ids_limit = type_ids_off + dh->type_ids_size * sizeof(dex_type_id);
+  always_assert_log(type_ids_off < dexsize, "type_ids_off out of range");
+  always_assert_log(type_ids_limit <= dexsize, "invalid type_ids_size");
+
+  auto proto_ids_off = (uint64_t)dh->proto_ids_off;
+  auto proto_ids_limit =
+      proto_ids_off + dh->proto_ids_size * sizeof(dex_proto_id);
+  always_assert_log(proto_ids_off < dexsize, "proto_ids_off out of range");
+  always_assert_log(proto_ids_limit <= dexsize, "invalid proto_ids_size");
+
+  auto field_ids_off = (uint64_t)dh->field_ids_off;
+  auto field_ids_limit =
+      field_ids_off + dh->field_ids_size * sizeof(dex_field_id);
+  always_assert_log(field_ids_off < dexsize, "field_ids_off out of range");
+  always_assert_log(field_ids_limit <= dexsize, "invalid field_ids_size");
+
+  auto meth_ids_off = (uint64_t)dh->method_ids_off;
+  auto meth_ids_limit =
+      meth_ids_off + dh->method_ids_size * sizeof(dex_method_id);
+  always_assert_log(meth_ids_off < dexsize, "method_ids_off out of range");
+  always_assert_log(meth_ids_limit <= dexsize, "invalid method_ids_size");
+
+  auto cls_defs_off = (uint64_t)dh->class_defs_off;
+  auto cls_defs_limit =
+      cls_defs_off + dh->class_defs_size * sizeof(dex_class_def);
+  always_assert_log(cls_defs_off < dexsize, "class_defs_off out of range");
+  always_assert_log(cls_defs_limit <= dexsize, "invalid class_defs_size");
 }
 
 void DexLoader::gather_input_stats(dex_stats_t* stats, const dex_header* dh) {
@@ -448,8 +522,34 @@ void DexLoader::gather_input_stats(dex_stats_t* stats, const dex_header* dh) {
 }
 
 void DexLoader::load_dex_class(int num) {
+  size_t dexsize = m_file->size();
   const dex_class_def* cdef = m_class_defs + num;
-  DexClass* dc = DexClass::create(m_idx.get(), cdef, m_dex_location);
+  auto idx = m_idx.get();
+
+  // Validate dex_class_def layout
+  auto annotations_off = cdef->annotations_off;
+  if (annotations_off != 0) {
+    // Validate dex_annotations_directory_item layout
+    always_assert_log(
+        annotations_off + sizeof(dex_annotations_directory_item) <= dexsize,
+        "Invalid cdef->annotations_off");
+    const dex_annotations_directory_item* annodir =
+        (const dex_annotations_directory_item*)idx->get_uint_data(
+            annotations_off);
+    auto cls_annos_off = annodir->class_annotations_off;
+    always_assert_log(cls_annos_off < dexsize,
+                      "Invalid annodir->class_annotations_off");
+    if (cls_annos_off != 0) {
+      // annotation_off_item is of size uint. So this is probably precise
+      // enough.
+      const uint32_t* adata = idx->get_uint_data(cls_annos_off);
+      uint32_t count = *adata;
+      always_assert_log(cls_annos_off + count <= dexsize,
+                        "Invalid class annotation set count");
+    }
+  }
+
+  DexClass* dc = DexClass::create(idx, cdef, m_location);
   // We may be inserting a nullptr here. Need to remove them later
   //
   // We're inserting nullptr because we can't mess up the indices of the other
@@ -457,19 +557,19 @@ void DexLoader::load_dex_class(int num) {
   m_classes->at(num) = dc;
 }
 
-const dex_header* DexLoader::get_dex_header(const char* location) {
-  m_file->open(location, boost::iostreams::mapped_file::readonly);
+const dex_header* DexLoader::get_dex_header(const char* file_name) {
+  m_file->open(file_name, boost::iostreams::mapped_file::readonly);
   if (!m_file->is_open()) {
-    fprintf(stderr, "error: cannot create memory-mapped file: %s\n", location);
+    fprintf(stderr, "error: cannot create memory-mapped file: %s\n", file_name);
     exit(EXIT_FAILURE);
   }
   return reinterpret_cast<const dex_header*>(m_file->const_data());
 }
 
-DexClasses DexLoader::load_dex(const char* location,
+DexClasses DexLoader::load_dex(const char* file_name,
                                dex_stats_t* stats,
                                int support_dex_version) {
-  const dex_header* dh = get_dex_header(location);
+  const dex_header* dh = get_dex_header(file_name);
   validate_dex_header(dh, m_file->size(), support_dex_version);
   return load_dex(dh, stats);
 }
@@ -487,28 +587,21 @@ DexClasses DexLoader::load_dex(const dex_header* dh, dex_stats_t* stats) {
 
   {
     auto num_threads = redex_parallel::default_num_threads();
-    std::vector<std::vector<std::exception_ptr>> exceptions_vec(num_threads);
-    std::vector<size_t> indices(dh->class_defs_size);
-    std::iota(indices.begin(), indices.end(), 0);
-    workqueue_run<size_t>(
-        [&exceptions_vec, this](sparta::SpartaWorkerState<size_t>* state,
-                                size_t num) {
+    std::vector<std::exception_ptr> all_exceptions;
+    std::mutex all_exceptions_mutex;
+    workqueue_run_for<size_t>(
+        0, dh->class_defs_size,
+        [&all_exceptions, &all_exceptions_mutex, this](uint32_t num) {
           try {
             load_dex_class(num);
           } catch (const std::exception& exc) {
             TRACE(MAIN, 1, "Worker throw the exception:%s", exc.what());
-            exceptions_vec[state->worker_id()].emplace_back(
-                std::current_exception());
+            std::lock_guard<std::mutex> lock_guard(all_exceptions_mutex);
+            all_exceptions.emplace_back(std::current_exception());
           }
         },
-        indices,
         num_threads);
 
-    std::vector<std::exception_ptr> all_exceptions;
-    for (auto& exceptions : exceptions_vec) {
-      all_exceptions.insert(all_exceptions.end(), exceptions.begin(),
-                            exceptions.end());
-    }
     if (!all_exceptions.empty()) {
       // At least one of the workers raised an exception
       aggregate_exception ae(all_exceptions);
@@ -554,7 +647,7 @@ static void balloon_all(const Scope& scope, bool throw_on_error) {
   }
 }
 
-DexClasses load_classes_from_dex(const char* location,
+DexClasses load_classes_from_dex(const DexLocation* location,
                                  bool balloon,
                                  bool throw_on_balloon_error,
                                  int support_dex_version) {
@@ -563,14 +656,16 @@ DexClasses load_classes_from_dex(const char* location,
                                throw_on_balloon_error, support_dex_version);
 }
 
-DexClasses load_classes_from_dex(const char* location,
+DexClasses load_classes_from_dex(const DexLocation* location,
                                  dex_stats_t* stats,
                                  bool balloon,
                                  bool throw_on_balloon_error,
                                  int support_dex_version) {
-  TRACE(MAIN, 1, "Loading classes from dex from %s", location);
+  TRACE(MAIN, 1, "Loading classes from dex from %s",
+        location->get_file_name().c_str());
   DexLoader dl(location);
-  auto classes = dl.load_dex(location, stats, support_dex_version);
+  auto classes = dl.load_dex(location->get_file_name().c_str(), stats,
+                             support_dex_version);
   if (balloon) {
     balloon_all(classes, throw_on_balloon_error);
   }
@@ -578,7 +673,7 @@ DexClasses load_classes_from_dex(const char* location,
 }
 
 DexClasses load_classes_from_dex(const dex_header* dh,
-                                 const char* location,
+                                 const DexLocation* location,
                                  bool balloon,
                                  bool throw_on_balloon_error) {
   DexLoader dl(location);
@@ -589,9 +684,9 @@ DexClasses load_classes_from_dex(const dex_header* dh,
   return classes;
 }
 
-std::string load_dex_magic_from_dex(const char* location) {
+std::string load_dex_magic_from_dex(const DexLocation* location) {
   DexLoader dl(location);
-  auto dh = dl.get_dex_header(location);
+  auto dh = dl.get_dex_header(location->get_file_name().c_str());
   return dh->magic;
 }
 

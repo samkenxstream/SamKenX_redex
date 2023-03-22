@@ -7,6 +7,7 @@
 
 #include "ReachableClasses.h"
 
+#include <boost/algorithm/string.hpp>
 #include <boost/filesystem.hpp>
 #include <chrono>
 #include <fstream>
@@ -143,8 +144,8 @@ void analyze_reflection(const Scope& scope) {
   const auto ATOMIC_REF_FIELD_UPDATER =
       "Ljava/util/concurrent/atomic/AtomicReferenceFieldUpdater;";
 
-  const std::unordered_map<std::string,
-                           std::unordered_map<std::string, ReflectionType>>
+  const std::unordered_map<std::string_view,
+                           std::unordered_map<std::string_view, ReflectionType>>
       refls = {
           {JAVA_LANG_CLASS,
            {
@@ -198,14 +199,14 @@ void analyze_reflection(const Scope& scope) {
       }
 
       // See if it matches something in refls
-      auto& method_name = insn->get_method()->get_name()->str();
-      auto& method_class_name =
+      auto method_class_name =
           insn->get_method()->get_class()->get_name()->str();
       auto method_map = refls.find(method_class_name);
       if (method_map == refls.end()) {
         continue;
       }
 
+      auto method_name = insn->get_method()->get_name()->str();
       auto refl_entry = method_map->second.find(method_name);
       if (refl_entry == method_map->second.end()) {
         continue;
@@ -245,10 +246,10 @@ void analyze_reflection(const Scope& scope) {
       std::lock_guard<std::mutex> l(mutation_mutex);
 
       TRACE(PGR, 4, "SRA ANALYZE: %s: type:%d %s.%s cls: %d %s %s str: %s",
-            insn->get_method()->get_name()->str().c_str(), refl_type,
-            method_class_name.c_str(), method_name.c_str(), arg_cls->obj_kind,
-            SHOW(arg_cls->dex_type), SHOW(arg_cls->dex_string),
-            SHOW(arg_str_value));
+            str_copy(method_name).c_str(), refl_type,
+            str_copy(method_class_name).c_str(), str_copy(method_name).c_str(),
+            arg_cls->obj_kind, SHOW(arg_cls->dex_type),
+            SHOW(arg_cls->dex_string), SHOW(arg_str_value));
 
       switch (refl_type) {
       case GET_FIELD:
@@ -397,7 +398,7 @@ void mark_onclick_attributes_reachable(
 }
 
 DexClass* maybe_class_from_string(const std::string& classname) {
-  auto dtype = DexType::get_type(classname.c_str());
+  auto dtype = DexType::get_type(classname);
   if (dtype == nullptr) {
     return nullptr;
   }
@@ -626,8 +627,7 @@ void analyze_serializable(const Scope& scope) {
     // any Serializable class, if they are themselves not Serializable.
     if (!children.count(child_super_type)) {
       for (auto meth : child_supercls->get_dmethods()) {
-        if (method::is_init(meth) &&
-            meth->get_proto()->get_args()->size() == 0) {
+        if (method::is_init(meth) && meth->get_proto()->get_args()->empty()) {
           meth->rstate.set_root(keep_reason::SERIALIZABLE);
         }
       }
@@ -671,7 +671,7 @@ void init_reachable_classes(const Scope& scope,
       // Classnames present in native libraries (lib/*/*.so)
       auto resources = create_resource_reader(config.apk_dir);
       for (const std::string& classname : resources->get_native_classes()) {
-        auto type = DexType::get_type(classname.c_str());
+        auto type = DexType::get_type(classname);
         if (type == nullptr) continue;
         TRACE(PGR, 3, "native_lib: %s", classname.c_str());
         mark_reachable_by_classname(type);
@@ -699,9 +699,9 @@ void init_reachable_classes(const Scope& scope,
 
     std::unordered_set<DexClass*> reflected_package_classes;
     for (auto clazz : scope) {
-      const char* cname = clazz->get_type()->get_name()->c_str();
+      const auto name = clazz->get_type()->get_name()->str();
       for (const auto& pkg : config.reflected_package_names) {
-        if (starts_with(cname, pkg.c_str())) {
+        if (boost::starts_with(name, pkg)) {
           reflected_package_classes.insert(clazz);
           continue;
         }
